@@ -140,10 +140,53 @@ def get_video_length(file_path):
     with VideoFileClip(file_path) as video:
         return video.duration
 
-def get_video_frame_count(file_path):
-    """get total frame count of video"""
-    with VideoFileClip(file_path) as video:
-        return int(video.fps * video.duration)
+def get_video_frame_count(file_path, count_decoded=False):
+    """Return the stream frame count without estimating it from duration."""
+
+    def probe_frame_count(entry, count_frames=False):
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+        ]
+        if count_frames:
+            cmd.append("-count_frames")
+        cmd.extend([
+            "-show_entries", f"stream={entry}",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ])
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            return None, completed.stderr.strip()
+
+        for value in completed.stdout.splitlines():
+            value = value.strip()
+            if value.isdigit():
+                return int(value), ""
+        return None, f"ffprobe did not report {entry}"
+
+    metadata_error = "metadata probe skipped"
+    if not count_decoded:
+        # Most MP4 files expose a frame count in the stream metadata. This is
+        # fast, but process_video verifies it against decoded frames whenever
+        # the initial extraction does not produce the requested frame count.
+        frame_count, metadata_error = probe_frame_count("nb_frames")
+        if frame_count is not None:
+            return frame_count
+
+    # Some containers do not store nb_frames. In that case, ask ffprobe to
+    # count the frames that can actually be decoded.
+    frame_count, decode_error = probe_frame_count(
+        "nb_read_frames", count_frames=True
+    )
+    if frame_count is not None:
+        return frame_count
+
+    raise RuntimeError(
+        "Unable to determine the video frame count with ffprobe: "
+        f"metadata probe: {metadata_error}; decode probe: {decode_error}"
+    )
 
 def process_video(args):
     """Extract frames and distinguish short videos from extraction failures."""
@@ -152,32 +195,47 @@ def process_video(args):
         if not os.path.isfile(video_path):
             return "failed", video_path, "video file does not exist"
 
-        total_frames = get_video_frame_count(video_path)
         os.makedirs(output_dir, exist_ok=True)
 
-        # Clean only generated frames left by an earlier incomplete attempt.
-        for frame_path in glob(os.path.join(output_dir, "frame*.jpg")):
-            os.remove(frame_path)
+        def extract_frames(total_frames):
+            # Clean only generated frames left by an earlier incomplete attempt.
+            for frame_path in glob(os.path.join(output_dir, "frame*.jpg")):
+                os.remove(frame_path)
+
+            frame_interval = max(1, total_frames // num_frames)
+            output_pattern = os.path.join(output_dir, "frame%d.jpg")
+            cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-loglevel", "error",
+                "-y",
+                "-threads", "1",
+                "-i", video_path,
+                "-vf", f"select=not(mod(n\\,{frame_interval})),setpts=N/FRAME_RATE/TB",
+                "-frames:v", str(num_frames),
+                "-threads", "1",
+                output_pattern,
+            ]
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            extracted_frames = glob(os.path.join(output_dir, "frame*.jpg"))
+            return completed, extracted_frames
+
+        total_frames = get_video_frame_count(video_path)
 
         if total_frames < num_frames:
-            return "short", video_path, f"only {total_frames} source frames"
+            total_frames = get_video_frame_count(video_path, count_decoded=True)
+            if total_frames < num_frames:
+                return "short", video_path, f"only {total_frames} source frames"
 
-        frame_interval = max(1, total_frames // num_frames)
-        output_pattern = os.path.join(output_dir, "frame%d.jpg")
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-loglevel", "error",
-            "-y",
-            "-threads", "1",
-            "-i", video_path,
-            "-vf", f"select=not(mod(n\\,{frame_interval})),setpts=N/FRAME_RATE/TB",
-            "-frames:v", str(num_frames),
-            "-threads", "1",
-            output_pattern,
-        ]
-        completed = subprocess.run(cmd, capture_output=True, text=True)
-        extracted_frames = glob(os.path.join(output_dir, "frame*.jpg"))
+        completed, extracted_frames = extract_frames(total_frames)
+        if completed.returncode != 0 or len(extracted_frames) != num_frames:
+            # Container metadata can overstate the number of decodable frames.
+            # Count decoded frames only for this failure path, then resample.
+            decoded_frames = get_video_frame_count(video_path, count_decoded=True)
+            if decoded_frames < num_frames:
+                return "short", video_path, f"only {decoded_frames} decodable source frames"
+            completed, extracted_frames = extract_frames(decoded_frames)
+
         if completed.returncode != 0 or len(extracted_frames) != num_frames:
             detail = completed.stderr.strip() or (
                 f"expected {num_frames} frames, extracted {len(extracted_frames)}"
