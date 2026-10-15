@@ -5,6 +5,7 @@ from glob import glob
 import numpy as np
 import torch
 import os
+import subprocess
 from moviepy import VideoFileClip
 import multiprocessing
 
@@ -136,59 +137,89 @@ class VideoFramesDataset(Dataset):
 
 def get_video_length(file_path):
     """get length of video by seconds"""
-    video = VideoFileClip(file_path)
-    return video.duration
+    with VideoFileClip(file_path) as video:
+        return video.duration
 
 def get_video_frame_count(file_path):
     """get total frame count of video"""
-    video = VideoFileClip(file_path)
-    return int(video.fps * video.duration)
+    with VideoFileClip(file_path) as video:
+        return int(video.fps * video.duration)
 
 def process_video(args):
-    """process single video"""
-    video_path, num_frames, output_dir = args  # index, video_path
-    if video_path.endswith(".mp4"):
-        try:
-            output_dir = output_dir 
-            os.makedirs(output_dir, exist_ok=True)
+    """Extract frames and distinguish short videos from extraction failures."""
+    video_path, num_frames, output_dir = args
+    try:
+        if not os.path.isfile(video_path):
+            return "failed", video_path, "video file does not exist"
 
-            total_frames = get_video_frame_count(video_path)
-            frame_interval = max(1, total_frames // num_frames)
+        total_frames = get_video_frame_count(video_path)
+        os.makedirs(output_dir, exist_ok=True)
 
-            cmd = (
-                f"ffmpeg -i {video_path} "
-                f"-vf select='not(mod(n\,{frame_interval}))',setpts=N/FRAME_RATE/TB "
-                f"-vframes {num_frames} {output_dir}/frame%d.jpg"
-                # f" > /dev/null 2>&1"
+        # Clean only generated frames left by an earlier incomplete attempt.
+        for frame_path in glob(os.path.join(output_dir, "frame*.jpg")):
+            os.remove(frame_path)
+
+        if total_frames < num_frames:
+            return "short", video_path, f"only {total_frames} source frames"
+
+        frame_interval = max(1, total_frames // num_frames)
+        output_pattern = os.path.join(output_dir, "frame%d.jpg")
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-loglevel", "error",
+            "-y",
+            "-threads", "1",
+            "-i", video_path,
+            "-vf", f"select=not(mod(n\\,{frame_interval})),setpts=N/FRAME_RATE/TB",
+            "-frames:v", str(num_frames),
+            "-threads", "1",
+            output_pattern,
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        extracted_frames = glob(os.path.join(output_dir, "frame*.jpg"))
+        if completed.returncode != 0 or len(extracted_frames) != num_frames:
+            detail = completed.stderr.strip() or (
+                f"expected {num_frames} frames, extracted {len(extracted_frames)}"
             )
-            ret = os.system(cmd)
-        except Exception as e:
-            print(f"Error processing {video_path}: {str(e)}")
-    elif video_path.endswith(".gif"):
-        try:
-            output_dir = os.path.join(output_dir)
-            os.makedirs(output_dir, exist_ok=True)
+            return "failed", video_path, detail
 
-            total_frames = get_video_frame_count(video_path)
-            frame_interval = max(1, total_frames // num_frames)
-
-            cmd = (
-                f"ffmpeg -i {video_path} "
-                f"-vf select='not(mod(n\,{frame_interval}))',setpts=N/FRAME_RATE/TB "
-                f"-vframes {num_frames} {output_dir}/frame%d.jpg"
-                f" > /dev/null 2>&1"
-            )
-            os.system(cmd)
-        except Exception as e:
-            print(f"Error processing {video_path}: {str(e)}")
+        return "ok", video_path, ""
+    except Exception as error:
+        return "failed", video_path, str(error)
 
 def process_video2frames(dir, ids, num_frames, output_base_dir):
     video_args = [(os.path.join(dir, f"{id}.mp4"), num_frames, os.path.join(output_base_dir, id)) for id in ids]
     logger.info(f"Processing {len(ids)} videos")
-    pool = multiprocessing.Pool(processes=24)
-    pool.map(process_video, video_args)
-    pool.close()
-    pool.join()
+    configured_workers = int(os.environ.get("NSG_VD_FRAME_WORKERS", "4"))
+    num_workers = max(1, min(configured_workers, len(video_args)))
+    logger.info(f"Extracting frames with {num_workers} worker(s)")
+
+    if num_workers == 1:
+        results = [process_video(args) for args in video_args]
+    else:
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            results = pool.map(process_video, video_args)
+
+    # Retry transient decoder/resource failures once without concurrency.
+    failed_indices = [index for index, result in enumerate(results) if result[0] == "failed"]
+    for index in failed_indices:
+        results[index] = process_video(video_args[index])
+
+    short_videos = [result for result in results if result[0] == "short"]
+    failed_videos = [result for result in results if result[0] == "failed"]
+    if short_videos:
+        logger.warning(
+            f"Filtered {len(short_videos)} video(s) with fewer than {num_frames} source frames"
+        )
+    if failed_videos:
+        preview = "; ".join(
+            f"{video_path}: {detail}" for _, video_path, detail in failed_videos[:5]
+        )
+        raise RuntimeError(
+            f"Failed to extract {num_frames} frames from {len(failed_videos)} video(s) "
+            f"after a sequential retry. First failures: {preview}"
+        )
     
 if __name__ == "__main__":
     for dataset_name in ["GenVideo"]:
