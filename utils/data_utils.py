@@ -50,12 +50,12 @@ def get_score_datasets(data_cfg, mode,
                 )
     return {"fake": fake_dataset, "real": real_dataset}
 
-def get_data_loaders_for_mmd(data_cfg, datasets, batch_size, shuffle=True):
+def get_data_loaders_for_mmd(data_cfg, datasets, batch_size):
     train_dataloaders = {}
     train_dataloaders["fake"]= DataLoader(datasets["fake"], batch_size=batch_size,
-                        shuffle=shuffle, num_workers=data_cfg.num_workers)
+                        shuffle=True, num_workers=data_cfg.num_workers)
     train_dataloaders["real"] = DataLoader(datasets["real"], batch_size=batch_size,
-                        shuffle=shuffle, num_workers=data_cfg.num_workers)
+                        shuffle=True, num_workers=data_cfg.num_workers)
     return train_dataloaders
   
 def get_ref_dataloaders(data_cfg, ref_model_names, mode="test", filter_frames=False):

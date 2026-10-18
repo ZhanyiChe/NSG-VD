@@ -69,12 +69,7 @@ def main(cfg: DictConfig):
                                               load_len=load_len,
                                               real_model=real_model,
                                               generation_model=fake_model, filter=False, resolution_size=cfg.data.resolution_size)
-            test_loader = get_data_loaders_for_mmd(
-                cfg.data,
-                test_datasets,
-                batch_size=cfg.data.val_batch_size,
-                shuffle=False,
-            )
+            test_loader = get_data_loaders_for_mmd(cfg.data, test_datasets, batch_size=cfg.data.val_batch_size)
             test_dataloaders[f"{fake_model}"] = test_loader
 
     if cfg.data.get("ref_models", None) is not None and cfg.data.get("ref_ratio", None) is not None:
