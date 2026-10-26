@@ -7,7 +7,8 @@ from torch.utils.data import DataLoader
 
 def get_score_datasets(data_cfg, mode, 
                        load_len=1000, generation_model = None,
-                       real_model = None, filter=True, pn_ratio=1, filter_frames=False, resolution_size=224):
+                       real_model = None, filter=True, pn_ratio=1, filter_frames=False,
+                       resolution_size=224, return_video_id=False):
     fake_len = int(load_len * pn_ratio)
     fake_dataset = ScoreFeaturesDataset(
                 score_config_path="./libs/eps_ad/imagnet.yml",
@@ -26,7 +27,8 @@ def get_score_datasets(data_cfg, mode,
                 load_len=fake_len,
                 filter_nsg=filter,
                 filter_frames=filter_frames,
-                resolution_size=resolution_size
+                resolution_size=resolution_size,
+                return_video_id=return_video_id,
                 )
     real_dataset = ScoreFeaturesDataset(
                 score_config_path="./libs/eps_ad/imagnet.yml",
@@ -47,15 +49,16 @@ def get_score_datasets(data_cfg, mode,
                 filter_frames=filter_frames,
                 resolution_size=resolution_size,
                 start_idx=200,
+                return_video_id=return_video_id,
                 )
     return {"fake": fake_dataset, "real": real_dataset}
 
-def get_data_loaders_for_mmd(data_cfg, datasets, batch_size):
+def get_data_loaders_for_mmd(data_cfg, datasets, batch_size, shuffle=True):
     train_dataloaders = {}
     train_dataloaders["fake"]= DataLoader(datasets["fake"], batch_size=batch_size,
-                        shuffle=True, num_workers=data_cfg.num_workers)
+                        shuffle=shuffle, num_workers=data_cfg.num_workers)
     train_dataloaders["real"] = DataLoader(datasets["real"], batch_size=batch_size,
-                        shuffle=True, num_workers=data_cfg.num_workers)
+                        shuffle=shuffle, num_workers=data_cfg.num_workers)
     return train_dataloaders
   
 def get_ref_dataloaders(data_cfg, ref_model_names, mode="test", filter_frames=False):
@@ -82,7 +85,8 @@ def get_ref_dataloaders(data_cfg, ref_model_names, mode="test", filter_frames=Fa
                         shuffle=False, num_workers=data_cfg.num_workers)
     return ref_dataloaders
 
-def get_ref_dataloader(data_cfg, ref_model_name, mode="test", filter_frames=False, resolution_size=224):
+def get_ref_dataloader(data_cfg, ref_model_name, mode="test", filter_frames=False,
+                       resolution_size=224, load_len=100, return_video_id=False):
     ref_dataset = ScoreFeaturesDataset(
         score_config_path="./libs/eps_ad/imagnet.yml",
         score_args_path="./libs/eps_ad/args.yml",
@@ -99,9 +103,39 @@ def get_ref_dataloader(data_cfg, ref_model_name, mode="test", filter_frames=Fals
         mode=mode, 
         filter_frames=filter_frames,
         resolution_size=resolution_size,
+        load_len=load_len,
+        return_video_id=return_video_id,
         )
     return DataLoader(ref_dataset, batch_size=data_cfg.batch_size,
                         shuffle=False, num_workers=data_cfg.num_workers)
+
+
+def get_reference_candidate_dataloader(
+        data_cfg,
+        ref_model_name,
+        mode="val",
+        load_len=1000,
+        filter_frames=False,
+        resolution_size=224):
+    """Build the ordered, ID-bearing reference candidate-pool loader.
+
+    This is intentionally separate from ``get_ref_dataloader`` so the original
+    fixed-reference path keeps its existing two-item batches and 100-video
+    default. Adaptive evaluation requires stable candidate IDs and must never
+    shuffle their order because selection indices address this exact order.
+    """
+
+    if isinstance(load_len, bool) or not isinstance(load_len, int) or load_len <= 0:
+        raise ValueError("load_len must be a positive integer")
+    return get_ref_dataloader(
+        data_cfg,
+        ref_model_name,
+        mode=mode,
+        filter_frames=filter_frames,
+        resolution_size=resolution_size,
+        load_len=load_len,
+        return_video_id=True,
+    )
   
 def get_classifier_dataset(data_cfg, mode, 
                             load_len=1000, generation_model = None,

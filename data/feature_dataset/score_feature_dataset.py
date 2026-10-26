@@ -70,7 +70,8 @@ class ScoreFeaturesDataset(Dataset):
                  filter_frames: bool=False,
                  resolution_size: int=224,
                  start_idx: int=0,
-                 ids_file: str=None
+                 ids_file: str=None,
+                 return_video_id: bool=False,
                  ):
         super().__init__()
         self.label = get_label_from_generation_model(generation_model)
@@ -96,6 +97,7 @@ class ScoreFeaturesDataset(Dataset):
         self.filter_frames = filter_frames
         self.eps = eps
         self.ids_file = ids_file
+        self.return_video_id = return_video_id
         self.label = get_label_from_generation_model(self.generation_model)
         self.dataset = self._get_dataset() # Access dataset for `_cache_exists method` and `_extract_feature`
         self.video_ids = self.dataset.video_ids
@@ -122,7 +124,16 @@ class ScoreFeaturesDataset(Dataset):
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
                     
-        return get_data(self.input_dir, self.video_ids[idx], self.feature_type, filter_frames=self.filter_frames), np.array([0 if self.label=="real" else 1], dtype=np.float32)
+        feature = get_data(
+            self.input_dir,
+            self.video_ids[idx],
+            self.feature_type,
+            filter_frames=self.filter_frames,
+        )
+        label = np.array([0 if self.label == "real" else 1], dtype=np.float32)
+        if self.return_video_id:
+            return feature, label, self.video_ids[idx]
+        return feature, label
 
     def _load_cache(self):
         self._setup_cache_paths()
