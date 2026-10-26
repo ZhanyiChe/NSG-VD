@@ -143,6 +143,39 @@ class ClipFeatureCache:
         self.record_dir.mkdir(parents=True, exist_ok=True)
         self._initialize_or_validate_metadata()
 
+    @classmethod
+    def open_existing(
+        cls,
+        cache_dir: Path,
+        normalization_tolerance: float = 1e-4,
+    ) -> "ClipFeatureCache":
+        """Open a cache from its recorded spec without loading OpenCLIP.
+
+        Evaluation only consumes previously generated embeddings.  Reading the
+        authoritative cache metadata here avoids loading the CLIP model merely
+        to reconstruct its embedding dimension, preprocessing fingerprint, or
+        installed-package version.
+        """
+
+        cache_dir = Path(cache_dir)
+        metadata_path = cache_dir / "metadata.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"CLIP cache metadata does not exist: {metadata_path}")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot read CLIP cache metadata {metadata_path}: {error}") from error
+        if metadata.get("format_version") != CLIP_CACHE_FORMAT_VERSION:
+            raise ValueError(
+                f"Unsupported CLIP cache format in {metadata_path}: "
+                f"{metadata.get('format_version')!r}"
+            )
+        try:
+            spec = ClipFeatureCacheSpec(**metadata["spec"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Invalid CLIP cache spec in {metadata_path}: {error}") from error
+        return cls(cache_dir, spec, normalization_tolerance=normalization_tolerance)
+
     def _initialize_or_validate_metadata(self) -> None:
         expected = {
             "format_version": CLIP_CACHE_FORMAT_VERSION,

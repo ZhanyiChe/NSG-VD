@@ -85,6 +85,31 @@ class ClipFeatureCacheTest(unittest.TestCase):
             reloaded = ClipFeatureCache(Path(temporary_dir), _cache_spec())
             self.assertTrue(torch.equal(reloaded.load_many(["A.mp4"]), embedding.unsqueeze(0)))
 
+    def test_open_existing_uses_recorded_spec_without_model_loading(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            cache_dir = Path(temporary_dir)
+            original = ClipFeatureCache(cache_dir, _cache_spec())
+            original.put(
+                "A.mp4",
+                torch.tensor([1.0, 0.0, 0.0]),
+                relative_frame_dir="real/MSR-VTT/val/A",
+                frame_names=["frame1.jpg", "frame2.jpg"],
+            )
+
+            reopened = ClipFeatureCache.open_existing(cache_dir)
+
+            self.assertEqual(reopened.spec, _cache_spec())
+            self.assertTrue(
+                torch.equal(reopened.load("A.mp4"), torch.tensor([1.0, 0.0, 0.0]))
+            )
+
+    def test_open_existing_does_not_create_a_missing_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            missing_dir = Path(temporary_dir) / "missing"
+            with self.assertRaisesRegex(FileNotFoundError, "metadata does not exist"):
+                ClipFeatureCache.open_existing(missing_dir)
+            self.assertFalse(missing_dir.exists())
+
     def test_cache_rejects_metadata_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             cache_dir = Path(temporary_dir)

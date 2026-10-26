@@ -6,6 +6,7 @@ logic can be tested independently from feature extraction and model loading.
 """
 
 from dataclasses import dataclass
+from collections import Counter
 import hashlib
 import math
 from pathlib import PurePosixPath
@@ -76,8 +77,8 @@ def _validate_candidates(candidate_ids: Sequence[str]) -> Tuple[str, ...]:
     normalized_ids = tuple(normalize_video_id(candidate_id) for candidate_id in candidate_ids)
     duplicate_ids = sorted(
         normalized_id
-        for normalized_id in set(normalized_ids)
-        if normalized_ids.count(normalized_id) > 1
+        for normalized_id, count in Counter(normalized_ids).items()
+        if count > 1
     )
     if duplicate_ids:
         raise ValueError(
