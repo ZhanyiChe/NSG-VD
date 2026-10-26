@@ -1,0 +1,19 @@
+defaults:
+  - test
+  - _self_
+
+hydra:
+  run:
+    dir: "results/outputs/clip-cache"
+
+clip_cache:
+  dataset_name: ${data.dataset_name}
+  label: real
+  generation_model: MSR-VTT
+  split: val
+  split_file: "${data.data_path}/split/${clip_cache.label}/${clip_cache.generation_model}/${clip_cache.split}_ids.txt"
+  frame_root: "${data.data_path}/video_frames/${clip_cache.label}/${clip_cache.generation_model}/${clip_cache.split}"
+  device: cuda
+  strict_frames: true
+  limit: null
+  frame_source: "existing_nsg_vd_8_frame_cache"
