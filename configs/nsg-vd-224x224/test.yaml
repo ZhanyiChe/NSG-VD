@@ -48,6 +48,7 @@ reference_selection:
   clip_pretrained: "datacomp_xl_s13b_b90k"
   clip_num_frames: 8
   clip_batch_size: 32
+  kernel_block_size: 16
   feature_cache_dir: "${data.data_path}/clip_features"
   selection_output_file: "reference_selection.csv"
   query_score_output_file: "query_scores.csv"
