@@ -26,6 +26,8 @@ trainer:
   loss_fn:
     name: "cross_entropy"
   val_check_interval: 1
+  checkpoint_interval: 1
+  resume_from: null
   num_gpus: 1
   device_ids: [0,1,2,3]
 

@@ -136,6 +136,25 @@ They correspond to the key experiments reported in our **NeurIPS 2025 paper**.
     
     **Recommendation**: Use MMD-MP for multiple generators or unbalanced data; MMD-D only for single-generator, large-scale training.
 
+    Training writes an atomic, full-state resume checkpoint after every epoch by default:
+    `./results/ckpts/nsg-vd/${experiment_name}/last_training_state.pth`. It contains the
+    model, optimizer, completed epoch, global step, best validation AUROC, and random-number
+    generator states. To resume the same run, keep the same `experiment_name` and pass the
+    checkpoint path:
+
+    ```bash
+    python train_dMMD.py \
+        --config-path configs/nsg-vd-224x224 \
+        --config-name standard.yaml \
+        data.generation_model=Pika \
+        experiment_name=repro-standard-Pika-mmd-mp-seed42 \
+        trainer.resume_from=./results/ckpts/nsg-vd/repro-standard-Pika-mmd-mp-seed42/last_training_state.pth
+    ```
+
+    On resume, TensorBoard reuses the same run directory and purges events at and after the
+    restored global step, so an incomplete epoch is replaced by the resumed data. A
+    `best_ckpt.pth` or `final_ckpt.pth` is model-only and cannot be used for exact resume.
+
 2. **Evaluate on a test set**
     ```bash
     TASK_TYPE=standard # standard or unbalance
