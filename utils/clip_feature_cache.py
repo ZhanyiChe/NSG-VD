@@ -6,8 +6,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Iterable, Mapping, Sequence, Tuple
+from urllib.parse import quote
 
 import numpy as np
 import torch
@@ -15,7 +17,9 @@ import torch
 from utils.reference_selection import normalize_video_id
 
 
-CLIP_CACHE_FORMAT_VERSION = 1
+CLIP_CACHE_FORMAT_VERSION = 2
+_STABLE_PREPROCESS_FINGERPRINT_PREFIX = "repr-v2:"
+_OBJECT_ADDRESS_PATTERN = re.compile(r"\bat 0x[0-9A-Fa-f]+\b")
 
 
 @dataclass(frozen=True)
@@ -72,9 +76,17 @@ def sha256_file(path: Path) -> str:
 
 
 def fingerprint_preprocess(preprocess) -> str:
-    """Fingerprint the concrete preprocessing transform representation."""
+    """Fingerprint a preprocessing pipeline without process-local addresses.
 
-    return hashlib.sha256(repr(preprocess).encode("utf-8")).hexdigest()
+    Torchvision includes callable memory addresses in transform ``repr`` output,
+    for example ``<function _convert_to_rgb at 0x...>``.  Hashing that raw
+    representation makes identical pipelines look different after every Python
+    restart, which prevents incremental cache generation from resuming.
+    """
+
+    canonical_repr = _OBJECT_ADDRESS_PATTERN.sub("at <address>", repr(preprocess))
+    digest = hashlib.sha256(canonical_repr.encode("utf-8")).hexdigest()
+    return f"{_STABLE_PREPROCESS_FINGERPRINT_PREFIX}{digest}"
 
 
 def _atomic_write_json(path: Path, payload: Mapping) -> None:
@@ -208,7 +220,13 @@ class ClipFeatureCache:
     @staticmethod
     def _cache_key(video_id: str) -> str:
         normalized_id = normalize_video_id(video_id)
-        return hashlib.sha256(normalized_id.encode("utf-8")).hexdigest()
+        filesystem_id = quote(normalized_id, safe="-_.")
+        if len(filesystem_id.encode("utf-8")) > 240:
+            raise ValueError(
+                f"Normalized video ID is too long for a readable cache filename: "
+                f"{normalized_id!r}."
+            )
+        return f"clip_{filesystem_id}"
 
     def _paths(self, video_id: str) -> Tuple[Path, Path]:
         cache_key = self._cache_key(video_id)

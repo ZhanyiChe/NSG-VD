@@ -34,13 +34,37 @@ from utils.reference_selection import normalize_video_id
 def _read_split_ids(split_file: Path):
     if not split_file.is_file():
         raise FileNotFoundError(f"Split file does not exist: {split_file}")
-    video_ids = [line.strip() for line in split_file.read_text().splitlines() if line.strip()]
+    video_ids = [
+        line.strip()
+        for line in split_file.read_text().splitlines()
+        if line.strip().endswith(".mp4")
+    ]
     if not video_ids:
-        raise ValueError(f"Split file is empty: {split_file}")
+        raise ValueError(f"Split file contains no .mp4 video IDs: {split_file}")
     normalized_ids = [normalize_video_id(video_id) for video_id in video_ids]
     if len(normalized_ids) != len(set(normalized_ids)):
         raise ValueError(f"Split file contains duplicate normalized video IDs: {split_file}")
     return video_ids
+
+
+def _select_video_ids(split_file: Path, start_idx: int, limit):
+    """Match VideoFramesDataset: filter MP4 IDs, then apply the requested slice."""
+
+    if isinstance(start_idx, bool) or not isinstance(start_idx, int) or start_idx < 0:
+        raise ValueError("clip_cache.start_idx must be a non-negative integer.")
+    video_ids = _read_split_ids(split_file)
+    if limit is None:
+        selected = video_ids[start_idx:]
+    else:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("clip_cache.limit must be a positive integer or null.")
+        selected = video_ids[start_idx : start_idx + limit]
+    if not selected:
+        raise ValueError(
+            f"No .mp4 video IDs selected from {split_file} with "
+            f"start_idx={start_idx}, limit={limit}."
+        )
+    return selected
 
 
 def _frame_directory_name(video_id: str) -> str:
@@ -58,12 +82,9 @@ def main(cfg: DictConfig):
     split_file = Path(to_absolute_path(cfg.clip_cache.split_file))
     frame_root = Path(to_absolute_path(cfg.clip_cache.frame_root))
     base_cache_dir = Path(to_absolute_path(cfg.reference_selection.feature_cache_dir))
-    video_ids = _read_split_ids(split_file)
-    if cfg.clip_cache.limit is not None:
-        limit = int(cfg.clip_cache.limit)
-        if limit <= 0:
-            raise ValueError("clip_cache.limit must be positive or null.")
-        video_ids = video_ids[:limit]
+    start_idx = int(cfg.clip_cache.start_idx)
+    limit = None if cfg.clip_cache.limit is None else int(cfg.clip_cache.limit)
+    video_ids = _select_video_ids(split_file, start_idx, limit)
 
     frame_paths_by_id = {}
     invalid_frames = []

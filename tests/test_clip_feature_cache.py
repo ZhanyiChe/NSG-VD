@@ -7,7 +7,11 @@ import numpy as np
 from PIL import Image
 import torch
 
-from utils.clip_feature_cache import ClipFeatureCache, ClipFeatureCacheSpec
+from utils.clip_feature_cache import (
+    ClipFeatureCache,
+    ClipFeatureCacheSpec,
+    fingerprint_preprocess,
+)
 from utils.clip_video_features import encode_video_frames, resolve_video_frame_paths
 
 
@@ -39,6 +43,20 @@ def _cache_spec():
 
 
 class ClipFeatureCacheTest(unittest.TestCase):
+    def test_preprocess_fingerprint_ignores_process_local_addresses(self):
+        class _AddressBearingPreprocess:
+            def __init__(self, address):
+                self.address = address
+
+            def __repr__(self):
+                return f"Compose(<function _convert_to_rgb at {self.address}>)"
+
+        first = fingerprint_preprocess(_AddressBearingPreprocess("0x1234abcd"))
+        second = fingerprint_preprocess(_AddressBearingPreprocess("0xdeadbeef"))
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("repr-v2:"))
+
     def test_video_aggregation_normalizes_frames_then_mean(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             frame_dir = Path(temporary_dir)
@@ -119,6 +137,38 @@ class ClipFeatureCacheTest(unittest.TestCase):
                     cache_dir,
                     replace(_cache_spec(), pretrained="different-weights"),
                 )
+
+    def test_cache_uses_human_readable_normalized_filenames(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            cache = ClipFeatureCache(Path(temporary_dir), _cache_spec())
+            embedding_path, record_path = cache._paths(
+                "/different/path/Crafter_884.MP4"
+            )
+
+            self.assertEqual(embedding_path.name, "clip_crafter_884.npy")
+            self.assertEqual(record_path.name, "clip_crafter_884.json")
+
+    def test_cache_percent_encodes_unsafe_filename_characters(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            cache = ClipFeatureCache(Path(temporary_dir), _cache_spec())
+            embedding_path, record_path = cache._paths("Video 1.mp4")
+
+            self.assertEqual(embedding_path.name, "clip_video%201.npy")
+            self.assertEqual(record_path.name, "clip_video%201.json")
+
+    def test_open_existing_rejects_an_old_cache_format(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            cache_dir = Path(temporary_dir)
+            ClipFeatureCache(cache_dir, _cache_spec())
+            metadata_path = cache_dir / "metadata.json"
+            metadata = metadata_path.read_text(encoding="utf-8")
+            metadata_path.write_text(
+                metadata.replace('"format_version": 2', '"format_version": 1', 1),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unsupported CLIP cache format"):
+                ClipFeatureCache.open_existing(cache_dir)
 
     def test_cache_rejects_unnormalized_embedding(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

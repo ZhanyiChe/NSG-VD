@@ -15,5 +15,6 @@ clip_cache:
   frame_root: "${data.data_path}/video_frames/${clip_cache.label}/${clip_cache.generation_model}/${clip_cache.split}"
   device: cuda
   strict_frames: true
+  start_idx: 0
   limit: null
   frame_source: "existing_nsg_vd_8_frame_cache"
