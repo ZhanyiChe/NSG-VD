@@ -39,6 +39,19 @@ data:
   batch_size: 24
   val_batch_size: 24
 
+reference_selection:
+  mode: original # original | random_topn | clip_topn
+  top_n: 100
+  candidate_pool_size: 1000
+  random_seed: ${seed}
+  clip_model_name: "ViT-L-14"
+  clip_pretrained: "datacomp_xl_s13b_b90k"
+  clip_num_frames: 8
+  clip_batch_size: 32
+  feature_cache_dir: "${data.data_path}/clip_features"
+  selection_output_file: "reference_selection.csv"
+  query_score_output_file: "query_scores.csv"
+
 regression: False
 exp_name: "default"
 
