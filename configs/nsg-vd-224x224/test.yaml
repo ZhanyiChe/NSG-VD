@@ -40,7 +40,8 @@ data:
   val_batch_size: 24
 
 reference_selection:
-  mode: original # original | random_topn | clip_topn
+  mode: original # original | fixed_topn | random_topn | clip_topn | clip_bottomn
+  save_original_query_scores: false
   top_n: 100
   candidate_pool_size: 1000
   random_seed: ${seed}

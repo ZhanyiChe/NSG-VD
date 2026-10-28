@@ -79,6 +79,61 @@ class AdaptiveEvaluationTest(unittest.TestCase):
         )
         torch.testing.assert_close(result.scores, expected, rtol=1e-12, atol=1e-12)
 
+    def test_clip_bottom_selection_flows_into_exact_mmd_score(self):
+        result = select_and_score_adaptive_batch(
+            self.pool,
+            query_ids=["query"],
+            query_raw_features=self.query_raw,
+            query_deep_features=self.query_deep,
+            mode="clip_bottomn",
+            top_n=2,
+            random_seed=42,
+            sigma=self.sigma,
+            sigma0=self.sigma0,
+            epsilon=self.epsilon,
+            is_smooth=True,
+            query_clip_embeddings=torch.tensor([[1.0, 0.0]]),
+        )
+
+        self.assertEqual(
+            [selection.reference_id for selection in result.selections[0]],
+            ["D", "C"],
+        )
+        expected = slow_adaptive_mmd_scores(
+            self.candidate_deep,
+            self.candidate_raw,
+            self.query_deep,
+            self.query_raw,
+            torch.tensor([[3, 2]]),
+            self.sigma,
+            self.sigma0,
+            self.epsilon,
+        )
+        torch.testing.assert_close(result.scores, expected, rtol=1e-12, atol=1e-12)
+
+    def test_fixed_selection_is_identical_for_every_query(self):
+        query_deep = self.query_deep.repeat(2, 1)
+        query_raw = self.query_raw.repeat(2, 1, 1)
+        result = select_and_score_adaptive_batch(
+            self.pool,
+            query_ids=["A", "different-query"],
+            query_raw_features=query_raw,
+            query_deep_features=query_deep,
+            mode="fixed_topn",
+            top_n=2,
+            random_seed=42,
+            sigma=self.sigma,
+            sigma0=self.sigma0,
+            epsilon=self.epsilon,
+            is_smooth=True,
+        )
+
+        self.assertEqual(result.selections[0], result.selections[1])
+        self.assertEqual(
+            [selection.candidate_index for selection in result.selections[0]],
+            [0, 1],
+        )
+
     def test_random_selection_is_independent_of_batch_repetition(self):
         arguments = dict(
             reference_pool=self.pool,
@@ -114,6 +169,22 @@ class AdaptiveEvaluationTest(unittest.TestCase):
                 self.query_raw,
                 self.query_deep,
                 "clip_topn",
+                2,
+                0,
+                self.sigma,
+                self.sigma0,
+                self.epsilon,
+                True,
+                query_clip_embeddings=torch.tensor([[1.0, 0.0]]),
+            )
+
+        with self.assertRaisesRegex(ValueError, "clip_bottomn requires"):
+            select_and_score_adaptive_batch(
+                pool_without_clip,
+                ["query"],
+                self.query_raw,
+                self.query_deep,
+                "clip_bottomn",
                 2,
                 0,
                 self.sigma,

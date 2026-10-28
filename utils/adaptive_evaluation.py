@@ -8,7 +8,9 @@ import torch
 from utils.adaptive_mmd import fast_adaptive_mmd_scores
 from utils.reference_selection import (
     ReferenceSelection,
+    select_clip_bottomn,
     select_clip_topn,
+    select_fixed_topn,
     select_random_topn,
     validate_reference_selection_mode,
 )
@@ -68,17 +70,20 @@ def select_and_score_adaptive_batch(
 
     mode = validate_reference_selection_mode(mode)
     if mode == "original":
-        raise ValueError("adaptive batch scoring only supports random_topn or clip_topn")
+        raise ValueError(
+            "adaptive batch scoring supports fixed_topn, random_topn, "
+            "clip_topn, or clip_bottomn"
+        )
     if len(query_ids) != query_raw_features.shape[0]:
         raise ValueError("query ID count does not match raw query features")
     if len(query_ids) != query_deep_features.shape[0]:
         raise ValueError("query ID count does not match deep query features")
 
-    if mode == "clip_topn":
+    if mode in {"clip_topn", "clip_bottomn"}:
         if reference_pool.clip_embeddings is None:
-            raise ValueError("clip_topn requires candidate CLIP embeddings")
+            raise ValueError(f"{mode} requires candidate CLIP embeddings")
         if query_clip_embeddings is None:
-            raise ValueError("clip_topn requires query CLIP embeddings")
+            raise ValueError(f"{mode} requires query CLIP embeddings")
         if query_clip_embeddings.ndim != 2:
             raise ValueError("query CLIP embeddings must be two-dimensional")
         if query_clip_embeddings.shape[0] != len(query_ids):
@@ -86,15 +91,28 @@ def select_and_score_adaptive_batch(
 
     batch_selections = []
     for query_index, query_id in enumerate(query_ids):
-        if mode == "random_topn":
+        if mode == "fixed_topn":
+            selections = select_fixed_topn(
+                reference_pool.video_ids,
+                top_n,
+            )
+        elif mode == "random_topn":
             selections = select_random_topn(
                 reference_pool.video_ids,
                 query_id,
                 top_n,
                 random_seed,
             )
-        else:
+        elif mode == "clip_topn":
             selections = select_clip_topn(
+                reference_pool.video_ids,
+                reference_pool.clip_embeddings,
+                query_id,
+                query_clip_embeddings[query_index],
+                top_n,
+            )
+        else:
+            selections = select_clip_bottomn(
                 reference_pool.video_ids,
                 reference_pool.clip_embeddings,
                 query_id,

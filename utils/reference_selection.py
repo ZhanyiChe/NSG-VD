@@ -16,7 +16,9 @@ from typing import Optional, Sequence, Tuple
 import torch
 
 
-REFERENCE_SELECTION_MODES = frozenset({"original", "random_topn", "clip_topn"})
+REFERENCE_SELECTION_MODES = frozenset(
+    {"original", "fixed_topn", "random_topn", "clip_topn", "clip_bottomn"}
+)
 _VIDEO_EXTENSIONS = frozenset({".avi", ".gif", ".mkv", ".mov", ".mp4", ".webm"})
 
 
@@ -146,6 +148,40 @@ def select_random_topn(
     )
 
 
+def select_fixed_topn(
+    candidate_ids: Sequence[str],
+    top_n: int,
+) -> Tuple[ReferenceSelection, ...]:
+    """Select the first ``top_n`` candidates for every query.
+
+    Unlike the query-adaptive selectors, this intentionally does not exclude a
+    candidate whose ID matches a query ID.  The legacy NSG-VD evaluation uses
+    the first fixed reference videos for every query without a per-query
+    exclusion step, and this mode is the controlled equivalent of that policy
+    on the shared adaptive-evaluation path.
+    """
+
+    if isinstance(top_n, bool) or not isinstance(top_n, int):
+        raise TypeError(f"top_n must be an integer, got {type(top_n).__name__}.")
+    if top_n <= 0:
+        raise ValueError(f"top_n must be positive, got {top_n}.")
+    _validate_candidates(candidate_ids)
+    if len(candidate_ids) < top_n:
+        raise ValueError(
+            f"Cannot select top_n={top_n} fixed references: "
+            f"only {len(candidate_ids)} candidates are available."
+        )
+
+    return tuple(
+        ReferenceSelection(
+            reference_id=candidate_ids[candidate_index],
+            candidate_index=candidate_index,
+            rank=rank,
+        )
+        for rank, candidate_index in enumerate(range(top_n), start=1)
+    )
+
+
 def _validate_normalized_embeddings(
     candidate_embeddings: torch.Tensor,
     query_embedding: torch.Tensor,
@@ -235,6 +271,43 @@ def select_clip_topn(
     ranked_indices = sorted(
         eligible_indices,
         key=lambda index: (-similarities[index], normalized_ids[index], index),
+    )[:top_n]
+
+    return tuple(
+        ReferenceSelection(
+            reference_id=candidate_ids[candidate_index],
+            candidate_index=candidate_index,
+            rank=rank,
+            similarity=float(similarities[candidate_index]),
+        )
+        for rank, candidate_index in enumerate(ranked_indices, start=1)
+    )
+
+
+def select_clip_bottomn(
+    candidate_ids: Sequence[str],
+    candidate_embeddings: torch.Tensor,
+    query_id: str,
+    query_embedding: torch.Tensor,
+    top_n: int,
+    normalization_tolerance: float = 1e-4,
+) -> Tuple[ReferenceSelection, ...]:
+    """Select the lowest-cosine-similarity references with stable tie-breaking."""
+
+    normalized_ids, eligible_indices = _eligible_candidate_indices(
+        candidate_ids, query_id, top_n
+    )
+    candidate_embeddings, query_embedding = _validate_normalized_embeddings(
+        candidate_embeddings,
+        query_embedding,
+        len(candidate_ids),
+        normalization_tolerance,
+    )
+
+    similarities = torch.mv(candidate_embeddings, query_embedding).detach().cpu().tolist()
+    ranked_indices = sorted(
+        eligible_indices,
+        key=lambda index: (similarities[index], normalized_ids[index], index),
     )[:top_n]
 
     return tuple(

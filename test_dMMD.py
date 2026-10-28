@@ -37,6 +37,9 @@ from sklearn.metrics import (
 )
 
 
+_CLIP_REFERENCE_MODES = frozenset({"clip_topn", "clip_bottomn"})
+
+
 def _reference_selection_mode(cfg):
     selection_cfg = cfg.get("reference_selection", None)
     if selection_cfg is None:
@@ -193,9 +196,9 @@ def _score_adaptive_query_loader(
         query_raw = inputs.float().to(device)
         _, query_deep = model.net(query_raw, out_feature=True)
         query_clip_embeddings = None
-        if selection_mode == "clip_topn":
+        if selection_mode in _CLIP_REFERENCE_MODES:
             if clip_cache is None:
-                raise ValueError("clip_topn requires a query CLIP cache")
+                raise ValueError(f"{selection_mode} requires a query CLIP cache")
             missing_ids = clip_cache.missing(query_ids)
             if missing_ids:
                 raise RuntimeError(
@@ -243,6 +246,7 @@ def _score_adaptive_query_loader(
                     "query_id": query_id,
                     "query_label": query_label,
                     "reference_id": selection.reference_id,
+                    "candidate_index": selection.candidate_index,
                     "rank": selection.rank,
                     "clip_similarity": selection.similarity,
                     "reference_mode": selection_mode,
@@ -266,7 +270,13 @@ def main(cfg: DictConfig):
     set_seed(cfg.seed)
     reference_mode = _reference_selection_mode(cfg)
     is_adaptive = reference_mode != "original"
+    record_original_scores = (
+        reference_mode == "original"
+        and bool(cfg.reference_selection.get("save_original_query_scores", False))
+    )
     logger.info(f"Reference-selection mode: {reference_mode}")
+    if record_original_scores:
+        logger.info("Original per-query score logging is enabled")
 
     # ----------------------------------- Model ---------------------------------- #
     logger.info(f"Loading model: {cfg.model.name}")
@@ -331,7 +341,7 @@ def main(cfg: DictConfig):
                                               generation_model=fake_model,
                                               filter=False,
                                               resolution_size=cfg.data.resolution_size,
-                                              return_video_id=is_adaptive)
+                                              return_video_id=(is_adaptive or record_original_scores))
             test_loader = get_data_loaders_for_mmd(
                 cfg.data,
                 test_datasets,
@@ -351,7 +361,7 @@ def main(cfg: DictConfig):
 
     if is_adaptive:
         candidate_clip_cache = None
-        if reference_mode == "clip_topn":
+        if reference_mode in _CLIP_REFERENCE_MODES:
             candidate_clip_cache = _open_validated_clip_cache(
                 cfg,
                 "real",
@@ -399,7 +409,7 @@ def main(cfg: DictConfig):
             if is_adaptive:
                 real_clip_cache = None
                 fake_clip_cache = None
-                if reference_mode == "clip_topn":
+                if reference_mode in _CLIP_REFERENCE_MODES:
                     real_clip_cache = _open_validated_clip_cache(
                         cfg,
                         "real",
@@ -433,10 +443,28 @@ def main(cfg: DictConfig):
                     f"Dataset: {name} | evaluated real={real_count}, fake={fake_count}"
                 )
             else:
-                test_results = test_dMMD(
-                    model, test_loader, feature_ref, ref_data,
-                    regression_model
+                legacy_result = test_dMMD(
+                    model,
+                    test_loader,
+                    feature_ref,
+                    ref_data,
+                    regression_model,
+                    return_query_rows=record_original_scores,
+                    generator_name=name,
+                    checkpoint_path=checkpoint_path,
+                    checkpoint_hash=checkpoint_hash,
                 )
+                if record_original_scores:
+                    test_results, query_rows = legacy_result
+                    all_query_rows.extend(query_rows)
+                    real_count = sum(row["query_label"] == 0 for row in query_rows)
+                    fake_count = sum(row["query_label"] == 1 for row in query_rows)
+                    logger.info(
+                        f"Dataset: {name} | recorded original scores "
+                        f"real={real_count}, fake={fake_count}"
+                    )
+                else:
+                    test_results = legacy_result
             results.append([name, 
                             test_results["recall"], 
                             test_results["accuracy"], 
@@ -469,22 +497,33 @@ def main(cfg: DictConfig):
     df.to_csv(csv_path, index=True, header=False)
     logger.success(f"Test results saved to {csv_path}")
 
-    if is_adaptive:
+    if is_adaptive or record_original_scores:
         query_score_path = os.path.join(
             cfg.log_path,
             cfg.reference_selection.query_score_output_file,
         )
+        pd.DataFrame(all_query_rows).to_csv(query_score_path, index=False)
+        logger.success(f"Query scores saved to {query_score_path}")
+    if is_adaptive:
         selection_path = os.path.join(
             cfg.log_path,
             cfg.reference_selection.selection_output_file,
         )
-        pd.DataFrame(all_query_rows).to_csv(query_score_path, index=False)
         pd.DataFrame(all_selection_rows).to_csv(selection_path, index=False)
-        logger.success(f"Query scores saved to {query_score_path}")
         logger.success(f"Reference selections saved to {selection_path}")
 
 @torch.no_grad()
-def test_dMMD(model, test_dataloader, feature_ref, ref_data, regression_model=None):
+def test_dMMD(
+        model,
+        test_dataloader,
+        feature_ref,
+        ref_data,
+        regression_model=None,
+        *,
+        return_query_rows=False,
+        generator_name=None,
+        checkpoint_path=None,
+        checkpoint_hash=None):
     model.eval()
     is_smooth = model.is_smooth
     sigma = model.sigma
@@ -496,10 +535,26 @@ def test_dMMD(model, test_dataloader, feature_ref, ref_data, regression_model=No
     real_dataloader = test_dataloader["real"]
     dt_clean = []
     dt_adv = []
+    real_ids = []
+    fake_ids = []
+    device = next(model.parameters()).device
     with torch.no_grad():
         for idx, (real_data, fake_data) in tqdm(enumerate(zip(real_dataloader, fake_dataloader)), total=len(real_dataloader), desc="Evaluating", leave=False):
-            x_real = real_data[0].float().cuda()
-            x_fake = fake_data[0].float().cuda()
+            x_real = real_data[0].float().to(device)
+            x_fake = fake_data[0].float().to(device)
+            if return_query_rows:
+                if len(real_data) < 3 or len(fake_data) < 3:
+                    raise ValueError(
+                        "return_query_rows=True requires ID-bearing real and fake batches"
+                    )
+                batch_real_ids = [str(video_id) for video_id in real_data[2]]
+                batch_fake_ids = [str(video_id) for video_id in fake_data[2]]
+                if len(batch_real_ids) != x_real.shape[0]:
+                    raise RuntimeError("real video IDs and NSG features are misaligned")
+                if len(batch_fake_ids) != x_fake.shape[0]:
+                    raise RuntimeError("fake video IDs and NSG features are misaligned")
+                real_ids.extend(batch_real_ids)
+                fake_ids.extend(batch_fake_ids)
             
             _,feature_cln = net(x_real,out_feature=True)
             _,feature_adv = net(x_fake,out_feature=True)
@@ -525,13 +580,43 @@ def test_dMMD(model, test_dataloader, feature_ref, ref_data, regression_model=No
         except ValueError as e:
             logger.error(f"DeepMMD testing failed due to {e}. Exiting the program.")
         
-    return {
+    metrics = {
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "accuracy": acc,
         "auroc": auroc,
     }
+    if not return_query_rows:
+        return metrics
+
+    if generator_name is None:
+        raise ValueError("generator_name is required when return_query_rows=True")
+    if len(real_ids) != len(dt_clean) or len(fake_ids) != len(dt_adv):
+        raise RuntimeError("recorded video IDs and original MMD scores are misaligned")
+
+    predictions = torch.as_tensor(predict).reshape(-1).cpu()
+    query_rows = []
+    for query_label, query_ids, query_scores, query_predictions in (
+            (0, real_ids, dt_clean, predictions[:len(dt_clean)]),
+            (1, fake_ids, dt_adv, predictions[len(dt_clean):])):
+        for query_id, score, prediction in zip(
+                query_ids, query_scores, query_predictions):
+            query_rows.append({
+                "generator": generator_name,
+                "query_id": query_id,
+                "query_label": query_label,
+                "mmd_score": float(score),
+                "prediction": int(prediction),
+                "threshold": 1.0,
+                "reference_mode": "original",
+                "top_n": int(feature_ref.shape[0]),
+                "random_seed": None,
+                "candidate_pool_size": int(feature_ref.shape[0]),
+                "checkpoint_path": checkpoint_path,
+                "checkpoint_hash": checkpoint_hash,
+            })
+    return metrics, query_rows
 
 
 @torch.no_grad()

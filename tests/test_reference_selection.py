@@ -5,7 +5,9 @@ import torch
 
 from utils.reference_selection import (
     normalize_video_id,
+    select_clip_bottomn,
     select_clip_topn,
+    select_fixed_topn,
     select_random_topn,
     validate_reference_selection_mode,
 )
@@ -14,6 +16,11 @@ from utils.reference_selection import (
 class ReferenceSelectionTest(unittest.TestCase):
     def test_validate_mode_normalizes_case_and_whitespace(self):
         self.assertEqual(validate_reference_selection_mode(" CLIP_TOPN "), "clip_topn")
+        self.assertEqual(validate_reference_selection_mode(" FIXED_TOPN "), "fixed_topn")
+        self.assertEqual(
+            validate_reference_selection_mode(" CLIP_BOTTOMN "),
+            "clip_bottomn",
+        )
         with self.assertRaisesRegex(ValueError, "Unsupported reference-selection mode"):
             validate_reference_selection_mode("nearest")
 
@@ -55,6 +62,68 @@ class ReferenceSelectionTest(unittest.TestCase):
                 torch.tensor([1.0, 0.0]),
                 top_n=1,
             )
+
+    def test_clip_bottomn_sorts_ascending_and_excludes_query(self):
+        candidate_ids = ["A.mp4", "query.mp4", "C.mp4", "B.mp4", "D.mp4"]
+        candidate_embeddings = torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, -1.0],
+                [-1.0, 0.0],
+            ]
+        )
+        query_embedding = torch.tensor([1.0, 0.0])
+
+        selections = select_clip_bottomn(
+            candidate_ids,
+            candidate_embeddings,
+            "/queries/QUERY.MP4",
+            query_embedding,
+            top_n=3,
+        )
+
+        self.assertEqual(
+            [item.reference_id for item in selections],
+            ["D.mp4", "B.mp4", "C.mp4"],
+        )
+        self.assertEqual([item.candidate_index for item in selections], [4, 3, 2])
+        self.assertEqual([item.rank for item in selections], [1, 2, 3])
+        self.assertAlmostEqual(selections[0].similarity, -1.0)
+
+    def test_clip_topn_and_bottomn_are_disjoint_when_pool_is_large_enough(self):
+        candidate_ids = [f"candidate_{index}.mp4" for index in range(6)]
+        angles = torch.linspace(0, torch.pi, steps=6)
+        candidate_embeddings = torch.stack(
+            [torch.cos(angles), torch.sin(angles)], dim=1
+        )
+        query_embedding = torch.tensor([1.0, 0.0])
+
+        top = select_clip_topn(
+            candidate_ids, candidate_embeddings, "query.mp4", query_embedding, 2
+        )
+        bottom = select_clip_bottomn(
+            candidate_ids, candidate_embeddings, "query.mp4", query_embedding, 2
+        )
+
+        self.assertTrue(
+            {item.candidate_index for item in top}.isdisjoint(
+                item.candidate_index for item in bottom
+            )
+        )
+
+    def test_fixed_topn_always_selects_the_first_candidates(self):
+        candidate_ids = ["query.mp4", "B.mp4", "C.mp4", "D.mp4"]
+
+        selections = select_fixed_topn(candidate_ids, top_n=3)
+
+        self.assertEqual(
+            [item.reference_id for item in selections],
+            ["query.mp4", "B.mp4", "C.mp4"],
+        )
+        self.assertEqual([item.candidate_index for item in selections], [0, 1, 2])
+        self.assertEqual([item.rank for item in selections], [1, 2, 3])
 
     def test_random_topn_is_reproducible_and_does_not_touch_global_rng(self):
         candidate_ids = [f"candidate_{index}.mp4" for index in range(30)]
