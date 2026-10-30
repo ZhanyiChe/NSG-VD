@@ -1,5 +1,5 @@
 from utils.experiment_utils import set_seed
-from data.utils import get_generation_models
+from data.utils import get_generation_models, get_label_from_generation_model
 from omegaconf import DictConfig
 from hydra.utils import to_absolute_path
 from models.deep_mmd import deep_MMD
@@ -38,6 +38,14 @@ from sklearn.metrics import (
 
 
 _CLIP_REFERENCE_MODES = frozenset({"clip_topn", "clip_bottomn"})
+
+
+def _evaluation_mode(cfg):
+    evaluation_cfg = cfg.get("evaluation", None)
+    mode = "standard" if evaluation_cfg is None else evaluation_cfg.get("mode", "standard")
+    if mode not in {"standard", "real_only"}:
+        raise ValueError("evaluation.mode must be one of: standard, real_only")
+    return mode
 
 
 def _reference_selection_mode(cfg):
@@ -167,6 +175,38 @@ def _classification_metrics(real_scores, fake_scores, regression_model=None):
     }
 
 
+def _real_only_metrics(real_scores, regression_model=None):
+    """Summarize false positives for an all-real query set."""
+
+    real_scores = torch.as_tensor(real_scores).reshape(-1).cpu()
+    if real_scores.numel() == 0:
+        raise ValueError("real_scores must not be empty")
+    if regression_model is None:
+        predictions = (real_scores > 1).int()
+    else:
+        predictions = torch.as_tensor(
+            regression_model.predict(real_scores.reshape(-1, 1).numpy())
+        ).reshape(-1).int()
+    if predictions.shape[0] != real_scores.shape[0]:
+        raise RuntimeError("real-only predictions and scores are misaligned")
+
+    false_positives = int((predictions == 1).sum().item())
+    true_negatives = int((predictions == 0).sum().item())
+    num_real = int(real_scores.numel())
+    tnr = true_negatives / num_real
+    fpr = false_positives / num_real
+    return {
+        "num_real": num_real,
+        "true_negatives": true_negatives,
+        "false_positives": false_positives,
+        "real_accuracy": tnr,
+        "tnr": tnr,
+        "fpr": fpr,
+        "mean_mmd_score": float(real_scores.mean().item()),
+        "predictions": predictions,
+    }
+
+
 @torch.no_grad()
 def _score_adaptive_query_loader(
         model,
@@ -258,6 +298,73 @@ def _score_adaptive_query_loader(
         raise RuntimeError(f"query loader is empty for {generator_name}, label={query_label}")
     return torch.cat(scores), query_rows, selection_rows
 
+
+@torch.no_grad()
+def _score_original_real_query_loader(
+        model,
+        query_dataloader,
+        feature_ref,
+        ref_data,
+        dataset_name,
+        checkpoint_path,
+        checkpoint_hash,
+        regression_model=None):
+    """Score one ordered all-real loader with the legacy fixed reference set."""
+
+    model.eval()
+    device = next(model.parameters()).device
+    scores = []
+    query_ids = []
+    for batch in tqdm(
+            query_dataloader,
+            desc=f"Scoring {dataset_name} real-only",
+            leave=False):
+        if len(batch) < 3:
+            raise ValueError("real-only evaluation requires ID-bearing batches")
+        inputs, labels, batch_ids = batch
+        if not torch.all(labels == 0):
+            raise ValueError("real-only query loader contains non-real labels")
+        inputs = inputs.float().to(device)
+        _, deep_features = model.net(inputs, out_feature=True)
+        batch_scores = MMD_batch2(
+            torch.cat([feature_ref, deep_features], dim=0),
+            feature_ref.shape[0],
+            torch.cat([ref_data, inputs], dim=0).view(
+                ref_data.shape[0] + inputs.shape[0], -1
+            ),
+            model.sigma,
+            model.sigma0_u,
+            model.ep,
+            is_smooth=model.is_smooth,
+        ).cpu()
+        scores.append(batch_scores)
+        query_ids.extend(str(video_id) for video_id in batch_ids)
+
+    if not scores:
+        raise RuntimeError(f"real-only query loader is empty for {dataset_name}")
+    scores = torch.cat(scores)
+    if len(query_ids) != len(scores):
+        raise RuntimeError("real-only video IDs and original MMD scores are misaligned")
+    metrics = _real_only_metrics(scores, regression_model)
+    rows = []
+    for query_id, score, prediction in zip(
+            query_ids, scores, metrics["predictions"]):
+        rows.append({
+            "generator": dataset_name,
+            "query_id": query_id,
+            "query_label": 0,
+            "mmd_score": float(score),
+            "prediction": int(prediction),
+            "threshold": 1.0,
+            "reference_mode": "original",
+            "top_n": int(feature_ref.shape[0]),
+            "random_seed": None,
+            "candidate_pool_size": int(feature_ref.shape[0]),
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_hash": checkpoint_hash,
+        })
+    return scores, rows, metrics
+
 @hydra.main(
     config_path="configs/nsg-vd-224x224",
     config_name="test.yaml",
@@ -268,12 +375,14 @@ def main(cfg: DictConfig):
     logger.info(OmegaConf.to_yaml(cfg))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(cfg.seed)
+    evaluation_mode = _evaluation_mode(cfg)
     reference_mode = _reference_selection_mode(cfg)
     is_adaptive = reference_mode != "original"
     record_original_scores = (
         reference_mode == "original"
         and bool(cfg.reference_selection.get("save_original_query_scores", False))
     )
+    logger.info(f"Evaluation mode: {evaluation_mode}")
     logger.info(f"Reference-selection mode: {reference_mode}")
     if record_original_scores:
         logger.info("Original per-query score logging is enabled")
@@ -326,29 +435,53 @@ def main(cfg: DictConfig):
                                         cfg.data.ref_model,
                                         mode="val",
                                         resolution_size=cfg.data.resolution_size)
-    test_dataloaders = {}
-    for fake_model in generation_models["fake"]["test"]:
-        for real_model in get_generation_models(cfg.data.dataset_name)["real"]["test"]:
-            real_model = cfg.data.test_real_model
-            if fake_model == "Sora":
-                load_len = 56
-            else:
-                load_len = cfg.data.test_load_len
-            test_datasets = get_score_datasets(cfg.data, 
-                                              "test",
-                                              load_len=load_len,
-                                              real_model=real_model,
-                                              generation_model=fake_model,
-                                              filter=False,
-                                              resolution_size=cfg.data.resolution_size,
-                                              return_video_id=(is_adaptive or record_original_scores))
-            test_loader = get_data_loaders_for_mmd(
-                cfg.data,
-                test_datasets,
-                batch_size=cfg.data.val_batch_size,
-                shuffle=not is_adaptive,
+    if evaluation_mode == "real_only":
+        real_model = str(cfg.real_only.real_model)
+        real_split = str(cfg.real_only.split)
+        if get_label_from_generation_model(real_model) != "real":
+            raise ValueError(
+                f"real_only.real_model must identify a real dataset, got {real_model}"
             )
-            test_dataloaders[f"{fake_model}"] = test_loader
+        real_only_loader = get_real_score_dataloader(
+            cfg.data,
+            real_model,
+            real_split,
+            load_len=int(cfg.real_only.load_len),
+            start_idx=int(cfg.real_only.start_idx),
+            batch_size=int(cfg.real_only.batch_size),
+            resolution_size=cfg.data.resolution_size,
+            return_video_id=True,
+        )
+        logger.info(
+            "Real-only query set: "
+            f"model={real_model}, split={real_split}, "
+            f"start_idx={cfg.real_only.start_idx}, requested={cfg.real_only.load_len}, "
+            f"effective={len(real_only_loader.dataset)}, batch_size={cfg.real_only.batch_size}"
+        )
+    else:
+        test_dataloaders = {}
+        for fake_model in generation_models["fake"]["test"]:
+            for real_model in get_generation_models(cfg.data.dataset_name)["real"]["test"]:
+                real_model = cfg.data.test_real_model
+                if fake_model == "Sora":
+                    load_len = 56
+                else:
+                    load_len = cfg.data.test_load_len
+                test_datasets = get_score_datasets(cfg.data,
+                                                  "test",
+                                                  load_len=load_len,
+                                                  real_model=real_model,
+                                                  generation_model=fake_model,
+                                                  filter=False,
+                                                  resolution_size=cfg.data.resolution_size,
+                                                  return_video_id=(is_adaptive or record_original_scores))
+                test_loader = get_data_loaders_for_mmd(
+                    cfg.data,
+                    test_datasets,
+                    batch_size=cfg.data.val_batch_size,
+                    shuffle=not is_adaptive,
+                )
+                test_dataloaders[f"{fake_model}"] = test_loader
 
     checkpoint_path = str(Path(to_absolute_path(str(cfg.ckpt_path))).resolve())
     checkpoint_hash = sha256_file(Path(checkpoint_path))
@@ -398,6 +531,94 @@ def main(cfg: DictConfig):
     if not is_adaptive:
         feature_ref = feature_ref.cuda()
     regression_model = None
+
+    if evaluation_mode == "real_only":
+        all_selection_rows = []
+        if is_adaptive:
+            query_clip_cache = None
+            if reference_mode in _CLIP_REFERENCE_MODES:
+                query_clip_cache = _open_validated_clip_cache(
+                    cfg,
+                    "real",
+                    real_model,
+                    real_split,
+                )
+            real_scores, query_rows, all_selection_rows = _score_adaptive_query_loader(
+                model,
+                real_only_loader,
+                reference_pool,
+                reference_mode,
+                cfg.reference_selection,
+                query_label=0,
+                generator_name=real_model,
+                checkpoint_path=checkpoint_path,
+                checkpoint_hash=checkpoint_hash,
+                clip_cache=query_clip_cache,
+            )
+            real_metrics = _real_only_metrics(real_scores, regression_model)
+        else:
+            real_scores, query_rows, real_metrics = _score_original_real_query_loader(
+                model,
+                real_only_loader,
+                feature_ref,
+                ref_data,
+                real_model,
+                checkpoint_path,
+                checkpoint_hash,
+                regression_model,
+            )
+
+        os.makedirs(cfg.log_path, exist_ok=True)
+        summary_path = os.path.join(
+            cfg.log_path,
+            cfg.real_only.summary_output_file,
+        )
+        summary_row = {
+            "dataset": real_model,
+            "split": real_split,
+            "start_idx": int(cfg.real_only.start_idx),
+            "requested_load_len": int(cfg.real_only.load_len),
+            "evaluated_real": real_metrics["num_real"],
+            "true_negatives": real_metrics["true_negatives"],
+            "false_positives": real_metrics["false_positives"],
+            "real_accuracy_percent": 100 * real_metrics["real_accuracy"],
+            "tnr_percent": 100 * real_metrics["tnr"],
+            "fpr_percent": 100 * real_metrics["fpr"],
+            "mean_mmd_score": real_metrics["mean_mmd_score"],
+            "threshold": 1.0,
+            "reference_mode": reference_mode,
+            "reference_size": (
+                int(cfg.reference_selection.top_n)
+                if is_adaptive else int(feature_ref.shape[0])
+            ),
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_hash": checkpoint_hash,
+        }
+        pd.DataFrame([summary_row]).to_csv(summary_path, index=False)
+
+        query_score_path = os.path.join(
+            cfg.log_path,
+            cfg.reference_selection.query_score_output_file,
+        )
+        pd.DataFrame(query_rows).to_csv(query_score_path, index=False)
+        if is_adaptive:
+            selection_path = os.path.join(
+                cfg.log_path,
+                cfg.reference_selection.selection_output_file,
+            )
+            pd.DataFrame(all_selection_rows).to_csv(selection_path, index=False)
+            logger.success(f"Reference selections saved to {selection_path}")
+
+        logger.info(
+            f"Real-only result: dataset={real_model}/{real_split} | "
+            f"N={real_metrics['num_real']} | TN={real_metrics['true_negatives']} | "
+            f"FP={real_metrics['false_positives']} | "
+            f"TNR={real_metrics['tnr']:.4f} | FPR={real_metrics['fpr']:.4f} | "
+            f"Mean MMD={real_metrics['mean_mmd_score']:.6f}"
+        )
+        logger.success(f"Real-only summary saved to {summary_path}")
+        logger.success(f"Query scores saved to {query_score_path}")
+        return
         
     #  Evaluate Model
     results = []

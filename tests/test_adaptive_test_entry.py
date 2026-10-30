@@ -5,7 +5,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from test_dMMD import (
+    _evaluation_mode,
+    _real_only_metrics,
     _reference_selection_mode,
+    _score_original_real_query_loader,
     test_adaptive_dMMD,
     test_dMMD as run_legacy_dMMD,
 )
@@ -159,6 +162,40 @@ class AdaptiveTestEntryTest(unittest.TestCase):
 
     def test_missing_reference_configuration_falls_back_to_original(self):
         self.assertEqual(_reference_selection_mode({}), "original")
+
+    def test_missing_evaluation_configuration_preserves_standard_mode(self):
+        self.assertEqual(_evaluation_mode({}), "standard")
+
+    def test_real_only_metrics_report_true_negatives_and_false_positives(self):
+        metrics = _real_only_metrics(torch.tensor([0.2, 1.0, 1.1, 2.0]))
+
+        self.assertEqual(metrics["num_real"], 4)
+        self.assertEqual(metrics["true_negatives"], 2)
+        self.assertEqual(metrics["false_positives"], 2)
+        self.assertEqual(metrics["tnr"], 0.5)
+        self.assertEqual(metrics["fpr"], 0.5)
+        self.assertAlmostEqual(metrics["mean_mmd_score"], 1.075)
+
+    def test_original_real_only_scorer_returns_one_row_per_real_query(self):
+        real = torch.tensor([[[0.1, 0.0]], [[0.3, 0.2]]])
+        loader = DataLoader(_QueryDataset(real, 0, "real"), batch_size=2)
+
+        scores, rows, metrics = _score_original_real_query_loader(
+            self.model,
+            loader,
+            self.pool.deep_features[:2],
+            self.pool.raw_features[:2],
+            "SyntheticReal",
+            "/tmp/checkpoint.pth",
+            "abc123",
+        )
+
+        self.assertEqual(len(scores), 2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(metrics["num_real"], 2)
+        self.assertEqual({row["query_label"] for row in rows}, {0})
+        self.assertEqual({row["query_id"] for row in rows}, {"real_0", "real_1"})
+        self.assertTrue(all(row["reference_mode"] == "original" for row in rows))
 
 
 if __name__ == "__main__":

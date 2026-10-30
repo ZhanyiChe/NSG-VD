@@ -60,6 +60,65 @@ def get_data_loaders_for_mmd(data_cfg, datasets, batch_size, shuffle=True):
     train_dataloaders["real"] = DataLoader(datasets["real"], batch_size=batch_size,
                         shuffle=shuffle, num_workers=data_cfg.num_workers)
     return train_dataloaders
+
+
+def get_real_score_dataloader(
+        data_cfg,
+        real_model,
+        mode,
+        load_len,
+        start_idx=0,
+        batch_size=None,
+        filter_frames=False,
+        resolution_size=224,
+        return_video_id=True):
+    """Build one ordered real-query loader without changing paired evaluation.
+
+    The existing :func:`get_score_datasets` intentionally preserves the
+    repository's paired real/fake behavior, including its fixed real
+    ``start_idx=200``.  Real-only evaluation needs the same feature dataset but
+    with an explicit split and slice, so it uses this separate helper instead
+    of altering the legacy path.
+    """
+
+    if mode not in {"train", "val", "test"}:
+        raise ValueError("mode must be one of: train, val, test")
+    if isinstance(load_len, bool) or not isinstance(load_len, int) or load_len <= 0:
+        raise ValueError("load_len must be a positive integer")
+    if isinstance(start_idx, bool) or not isinstance(start_idx, int) or start_idx < 0:
+        raise ValueError("start_idx must be a non-negative integer")
+    if batch_size is None:
+        batch_size = data_cfg.val_batch_size
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
+    dataset = ScoreFeaturesDataset(
+        score_config_path="./libs/eps_ad/imagnet.yml",
+        score_args_path="./libs/eps_ad/args.yml",
+        data_path=data_cfg.data_path,
+        dataset_name=data_cfg.dataset_name,
+        generation_model=real_model,
+        input_shape=(224, 224),
+        process_batch_size=3,
+        diffuse_steps=data_cfg.diffuse_steps,
+        device="cuda",
+        verbose=False,
+        feature_type=data_cfg.feature_type,
+        num_frames=8,
+        mode=mode,
+        load_len=load_len,
+        filter_nsg=False,
+        filter_frames=filter_frames,
+        resolution_size=resolution_size,
+        start_idx=start_idx,
+        return_video_id=return_video_id,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=data_cfg.num_workers,
+    )
   
 def get_ref_dataloaders(data_cfg, ref_model_names, mode="test", filter_frames=False):
     ref_dataloaders = {}

@@ -54,6 +54,17 @@ reference_selection:
   selection_output_file: "reference_selection.csv"
   query_score_output_file: "query_scores.csv"
 
+evaluation:
+  mode: "standard" # standard | real_only
+
+real_only:
+  real_model: "${data.test_real_model}"
+  split: "test" # train | val | test
+  start_idx: 200
+  load_len: "${data.test_load_len}"
+  batch_size: "${data.val_batch_size}"
+  summary_output_file: "real_only_results.csv"
+
 regression: False
 exp_name: "default"
 
