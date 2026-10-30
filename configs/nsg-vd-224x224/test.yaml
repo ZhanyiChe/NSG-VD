@@ -42,6 +42,7 @@ data:
 reference_selection:
   mode: original # original | fixed_topn | random_topn | clip_topn | clip_bottomn
   save_original_query_scores: false
+  auto_cache_query_features: true
   top_n: 100
   candidate_pool_size: 1000
   random_seed: ${seed}

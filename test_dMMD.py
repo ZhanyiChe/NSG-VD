@@ -11,8 +11,19 @@ from utils.adaptive_evaluation import (
     select_and_score_adaptive_batch,
 )
 from utils.adaptive_mmd import precompute_candidate_kernel_matrix
-from utils.clip_feature_cache import ClipFeatureCache, sha256_file
-from utils.clip_video_features import clip_cache_model_key
+from utils.clip_feature_cache import (
+    ClipFeatureCache,
+    ClipFeatureCacheSpec,
+    fingerprint_preprocess,
+    sha256_file,
+)
+from utils.clip_video_features import (
+    clip_cache_model_key,
+    encode_video_frames,
+    get_image_embedding_dim,
+    load_open_clip_model,
+    resolve_video_frame_paths,
+)
 from utils.reference_selection import (
     normalize_video_id,
     validate_reference_selection_mode,
@@ -38,6 +49,7 @@ from sklearn.metrics import (
 
 
 _CLIP_REFERENCE_MODES = frozenset({"clip_topn", "clip_bottomn"})
+_CLIP_FRAME_SOURCE = "existing_nsg_vd_8_frame_cache"
 
 
 def _evaluation_mode(cfg):
@@ -92,6 +104,234 @@ def _open_validated_clip_cache(cfg, label, generation_model, split):
             f"{mismatches}"
         )
     return cache
+
+
+def _dataset_video_ids(dataloader):
+    """Return the exact ordered video IDs exposed by a query dataloader."""
+
+    video_ids = getattr(dataloader.dataset, "video_ids", None)
+    if video_ids is None:
+        raise ValueError(
+            "CLIP query pre-caching requires dataloader.dataset.video_ids so cached "
+            "embeddings remain aligned with NSG features."
+        )
+    raw_ids = tuple(str(video_id) for video_id in video_ids)
+    normalized_ids = [normalize_video_id(video_id) for video_id in raw_ids]
+    if len(normalized_ids) != len(set(normalized_ids)):
+        raise ValueError("Query dataset contains duplicate normalized video IDs.")
+    return raw_ids
+
+
+def _merge_clip_cache_requests(requests):
+    """Merge repeated datasets while preserving first-seen query-ID order."""
+
+    merged = {}
+    for label, generation_model, split, video_ids in requests:
+        key = (str(label), str(generation_model), str(split))
+        if key not in merged:
+            merged[key] = []
+        known = {normalize_video_id(video_id) for video_id in merged[key]}
+        for video_id in video_ids:
+            raw_id = str(video_id)
+            normalized_id = normalize_video_id(raw_id)
+            if normalized_id not in known:
+                merged[key].append(raw_id)
+                known.add(normalized_id)
+    return [(*key, tuple(video_ids)) for key, video_ids in merged.items()]
+
+
+def _collect_query_clip_cache_requests(
+        evaluation_mode,
+        cfg,
+        real_only_loader=None,
+        test_dataloaders=None):
+    """Describe only the query videos that the current evaluation will score."""
+
+    if evaluation_mode == "real_only":
+        return [
+            (
+                "real",
+                str(cfg.real_only.real_model),
+                str(cfg.real_only.split),
+                _dataset_video_ids(real_only_loader),
+            )
+        ]
+
+    requests = []
+    for fake_model, loaders in test_dataloaders.items():
+        requests.extend([
+            (
+                "real",
+                str(cfg.data.test_real_model),
+                "test",
+                _dataset_video_ids(loaders["real"]),
+            ),
+            (
+                "fake",
+                str(fake_model),
+                "test",
+                _dataset_video_ids(loaders["fake"]),
+            ),
+        ])
+    return _merge_clip_cache_requests(requests)
+
+
+def _cache_query_clip_features(cfg, requests, device):
+    """Incrementally cache missing CLIP query features before MMD evaluation.
+
+    Existing entries are validated and skipped. OpenCLIP is loaded only when at
+    least one requested query embedding is absent, and one model instance is
+    reused for every missing query dataset in this evaluation run.
+    """
+
+    requests = list(requests)
+    if not requests:
+        return
+
+    pending = []
+    total_requested = 0
+    total_cached = 0
+    for label, generation_model, split, video_ids in requests:
+        if not video_ids:
+            raise ValueError(
+                f"CLIP query set is empty: {label}/{generation_model}/{split}"
+            )
+        total_requested += len(video_ids)
+        try:
+            cache = _open_validated_clip_cache(
+                cfg, label, generation_model, split
+            )
+        except FileNotFoundError:
+            cache = None
+            missing_ids = tuple(video_ids)
+        else:
+            missing_ids = cache.missing(video_ids)
+            total_cached += len(video_ids) - len(missing_ids)
+        if missing_ids:
+            pending.append(
+                (label, generation_model, split, tuple(video_ids), missing_ids)
+            )
+
+    logger.info(
+        f"CLIP query pre-cache check: requested={total_requested}, "
+        f"cached={total_cached}, missing={sum(len(item[4]) for item in pending)}"
+    )
+    if not pending:
+        logger.info("All query CLIP features are already cached; skipping extraction")
+        return
+
+    if not bool(
+            cfg.reference_selection.get("auto_cache_query_features", True)):
+        first = pending[0]
+        raise RuntimeError(
+            "Query CLIP cache is incomplete and automatic extraction is disabled: "
+            f"{sum(len(item[4]) for item in pending)} missing; "
+            f"first dataset={first[0]}/{first[1]}/{first[2]}, "
+            f"first IDs={list(first[4][:10])}"
+        )
+
+    clip_model = None
+    try:
+        logger.info(
+            "Loading OpenCLIP to extract missing query features: "
+            f"model={cfg.reference_selection.clip_model_name}, "
+            f"pretrained={cfg.reference_selection.clip_pretrained}, device={device}"
+        )
+        clip_model, preprocess, open_clip_version = load_open_clip_model(
+            str(cfg.reference_selection.clip_model_name),
+            str(cfg.reference_selection.clip_pretrained),
+            device,
+        )
+        embedding_dim = get_image_embedding_dim(clip_model)
+        preprocess_fingerprint = fingerprint_preprocess(preprocess)
+        data_root = Path(to_absolute_path(str(cfg.data.data_path)))
+        num_frames = int(cfg.reference_selection.clip_num_frames)
+        frame_batch_size = int(cfg.reference_selection.clip_batch_size)
+
+        for label, generation_model, split, video_ids, _ in pending:
+            split_file = (
+                data_root
+                / "split"
+                / label
+                / generation_model
+                / f"{split}_ids.txt"
+            )
+            if not split_file.is_file():
+                raise FileNotFoundError(
+                    f"CLIP query split file does not exist: {split_file}"
+                )
+            frame_root = (
+                data_root
+                / "video_frames"
+                / label
+                / generation_model
+                / split
+            )
+            spec = ClipFeatureCacheSpec(
+                model_name=str(cfg.reference_selection.clip_model_name),
+                pretrained=str(cfg.reference_selection.clip_pretrained),
+                open_clip_version=open_clip_version,
+                embedding_dim=embedding_dim,
+                num_frames=num_frames,
+                frame_source=_CLIP_FRAME_SOURCE,
+                preprocess_fingerprint=preprocess_fingerprint,
+                split_sha256=sha256_file(split_file),
+                dataset_name=str(cfg.data.dataset_name),
+                label=label,
+                generation_model=generation_model,
+                split=split,
+            )
+            cache = ClipFeatureCache(
+                _clip_cache_directory(cfg, label, generation_model, split),
+                spec,
+            )
+            missing_ids = cache.missing(video_ids)
+            logger.info(
+                "Caching query CLIP features: "
+                f"dataset={label}/{generation_model}/{split}, "
+                f"queries={len(video_ids)}, missing={len(missing_ids)}"
+            )
+            for video_id in tqdm(
+                    missing_ids,
+                    desc=f"Caching CLIP {generation_model}/{split}",
+                    unit="video"):
+                frame_paths = resolve_video_frame_paths(
+                    frame_root / video_id,
+                    num_frames,
+                )
+                embedding = encode_video_frames(
+                    clip_model,
+                    preprocess,
+                    frame_paths,
+                    device,
+                    frame_batch_size,
+                )
+                cache.put(
+                    video_id,
+                    embedding,
+                    relative_frame_dir=str(
+                        frame_paths[0].parent.relative_to(frame_root.parent)
+                    ),
+                    frame_names=[path.name for path in frame_paths],
+                )
+
+            remaining_ids = cache.missing(video_ids)
+            if remaining_ids:
+                raise RuntimeError(
+                    f"CLIP query cache remains incomplete for "
+                    f"{label}/{generation_model}/{split}: "
+                    f"{len(remaining_ids)} missing."
+                )
+            logger.success(
+                "Query CLIP cache ready: "
+                f"dataset={label}/{generation_model}/{split}, "
+                f"queries={len(video_ids)}, path={cache.cache_dir}"
+            )
+    finally:
+        if clip_model is not None:
+            del clip_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -482,6 +722,19 @@ def main(cfg: DictConfig):
                     shuffle=not is_adaptive,
                 )
                 test_dataloaders[f"{fake_model}"] = test_loader
+
+    if reference_mode in _CLIP_REFERENCE_MODES:
+        query_cache_requests = _collect_query_clip_cache_requests(
+            evaluation_mode,
+            cfg,
+            real_only_loader=(
+                real_only_loader if evaluation_mode == "real_only" else None
+            ),
+            test_dataloaders=(
+                test_dataloaders if evaluation_mode == "standard" else None
+            ),
+        )
+        _cache_query_clip_features(cfg, query_cache_requests, device)
 
     checkpoint_path = str(Path(to_absolute_path(str(cfg.ckpt_path))).resolve())
     checkpoint_hash = sha256_file(Path(checkpoint_path))

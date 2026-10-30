@@ -1,11 +1,18 @@
 from types import SimpleNamespace
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from omegaconf import OmegaConf
 
 from test_dMMD import (
+    _cache_query_clip_features,
+    _collect_query_clip_cache_requests,
     _evaluation_mode,
+    _merge_clip_cache_requests,
     _real_only_metrics,
     _reference_selection_mode,
     _score_original_real_query_loader,
@@ -165,6 +172,87 @@ class AdaptiveTestEntryTest(unittest.TestCase):
 
     def test_missing_evaluation_configuration_preserves_standard_mode(self):
         self.assertEqual(_evaluation_mode({}), "standard")
+
+    def test_clip_cache_requests_merge_repeated_real_queries(self):
+        requests = _merge_clip_cache_requests([
+            ("real", "MSR-VTT", "test", ("Video1", "video2")),
+            ("fake", "GenA", "test", ("fake1",)),
+            ("real", "MSR-VTT", "test", ("video1", "video3")),
+        ])
+
+        self.assertEqual(requests, [
+            ("real", "MSR-VTT", "test", ("Video1", "video2", "video3")),
+            ("fake", "GenA", "test", ("fake1",)),
+        ])
+
+    def test_real_only_clip_cache_request_uses_effective_dataset_ids(self):
+        loader = DataLoader(_QueryDataset(
+            torch.zeros(2, 1, 2), 0, "real"
+        ), batch_size=2)
+        loader.dataset.video_ids = ["kept_a", "kept_b"]
+        cfg = OmegaConf.create({
+            "real_only": {"real_model": "Kinetics-400", "split": "test"},
+        })
+
+        requests = _collect_query_clip_cache_requests(
+            "real_only", cfg, real_only_loader=loader
+        )
+
+        self.assertEqual(requests, [
+            ("real", "Kinetics-400", "test", ("kept_a", "kept_b")),
+        ])
+
+    def test_query_clip_precache_extracts_missing_then_skips_existing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data_root = root / "GenVideo"
+            split_file = data_root / "split/real/MSR-VTT/test_ids.txt"
+            split_file.parent.mkdir(parents=True)
+            split_file.write_text("Video_A.mp4\nvideo_b.mp4\n", encoding="utf-8")
+            for video_id in ("Video_A", "video_b"):
+                frame_dir = data_root / f"video_frames/real/MSR-VTT/test/{video_id}"
+                frame_dir.mkdir(parents=True)
+                for frame_index in range(8):
+                    (frame_dir / f"{frame_index:03d}.jpg").touch()
+
+            cfg = OmegaConf.create({
+                "data": {
+                    "data_path": str(data_root),
+                    "dataset_name": "GenVideo",
+                },
+                "reference_selection": {
+                    "feature_cache_dir": str(data_root / "clip_features"),
+                    "clip_model_name": "Fake-CLIP",
+                    "clip_pretrained": "fake-weights",
+                    "clip_num_frames": 8,
+                    "clip_batch_size": 4,
+                    "auto_cache_query_features": True,
+                },
+            })
+            fake_model = SimpleNamespace(
+                visual=SimpleNamespace(output_dim=3),
+            )
+            requests = [
+                ("real", "MSR-VTT", "test", ("Video_A", "video_b")),
+            ]
+
+            with patch(
+                    "test_dMMD.load_open_clip_model",
+                    return_value=(fake_model, object(), "test-version")) as load_mock, patch(
+                    "test_dMMD.encode_video_frames",
+                    return_value=torch.tensor([1.0, 0.0, 0.0])) as encode_mock:
+                _cache_query_clip_features(cfg, requests, torch.device("cpu"))
+                self.assertEqual(load_mock.call_count, 1)
+                self.assertEqual(encode_mock.call_count, 2)
+
+            with patch(
+                    "test_dMMD.load_open_clip_model",
+                    side_effect=AssertionError("OpenCLIP must not reload")) as load_mock, patch(
+                    "test_dMMD.encode_video_frames",
+                    side_effect=AssertionError("Cached videos must not be re-encoded")) as encode_mock:
+                _cache_query_clip_features(cfg, requests, torch.device("cpu"))
+                load_mock.assert_not_called()
+                encode_mock.assert_not_called()
 
     def test_real_only_metrics_report_true_negatives_and_false_positives(self):
         metrics = _real_only_metrics(torch.tensor([0.2, 1.0, 1.1, 2.0]))
