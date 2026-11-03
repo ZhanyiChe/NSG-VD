@@ -55,6 +55,12 @@ reference_selection:
   selection_output_file: "reference_selection.csv"
   query_score_output_file: "query_scores.csv"
 
+original_reference:
+  split: "val" # train | val | test
+  start_idx: 0
+  load_len: ${data.ref_load_len}
+  ids_file: null # optional custom ordered ID file
+
 evaluation:
   mode: "standard" # standard | real_only
 

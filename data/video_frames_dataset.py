@@ -94,7 +94,16 @@ class VideoFramesDataset(Dataset):
             video_ids_txt = self.ids_file
             assert os.path.exists(video_ids_txt), f"video_ids_txt not found"
             with open(video_ids_txt, "r") as f:
-                video_ids = [line.strip() + ".mp4" for line in f if line.strip()]
+                video_ids = []
+                for line in f:
+                    video_id = line.strip()
+                    if not video_id:
+                        continue
+                    if video_id.lower().endswith(".mp4"):
+                        video_id = video_id[:-4] + ".mp4"
+                    else:
+                        video_id += ".mp4"
+                    video_ids.append(video_id)
         else:
             video_ids_txt = os.path.join(self.data_path, "split", self.label, self.generation_model, f"{self.mode}_ids.txt")
             assert os.path.exists(video_ids_txt), f"video_ids_txt not found"

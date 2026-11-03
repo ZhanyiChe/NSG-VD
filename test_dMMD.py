@@ -67,6 +67,42 @@ def _reference_selection_mode(cfg):
     return validate_reference_selection_mode(selection_cfg.get("mode", "original"))
 
 
+def _original_reference_options(cfg):
+    """Return validated fixed-reference options with legacy-compatible defaults."""
+
+    reference_cfg = cfg.get("original_reference", None)
+    if reference_cfg is None:
+        split = "val"
+        start_idx = 0
+        load_len = int(cfg.data.ref_load_len)
+        ids_file = None
+    else:
+        split = str(reference_cfg.get("split", "val"))
+        start_idx = reference_cfg.get("start_idx", 0)
+        load_len = reference_cfg.get("load_len", cfg.data.ref_load_len)
+        ids_file = reference_cfg.get("ids_file", None)
+
+    if split not in {"train", "val", "test"}:
+        raise ValueError(
+            "original_reference.split must be one of: train, val, test"
+        )
+    if isinstance(start_idx, bool) or not isinstance(start_idx, int) or start_idx < 0:
+        raise ValueError("original_reference.start_idx must be a non-negative integer")
+    if isinstance(load_len, bool) or not isinstance(load_len, int) or load_len <= 0:
+        raise ValueError("original_reference.load_len must be a positive integer")
+    if ids_file is not None:
+        ids_file = str(ids_file).strip()
+        if not ids_file:
+            raise ValueError("original_reference.ids_file must be null or a non-empty path")
+
+    return {
+        "split": split,
+        "start_idx": start_idx,
+        "load_len": load_len,
+        "ids_file": ids_file,
+    }
+
+
 def _clip_cache_directory(cfg, label, generation_model, split):
     base_dir = Path(to_absolute_path(str(cfg.reference_selection.feature_cache_dir)))
     return (
@@ -670,6 +706,7 @@ def main(cfg: DictConfig):
     
     # ----------------------------------- Data ----------------------------------- #
     generation_models = get_generation_models(cfg.data.dataset_name)
+    original_reference_options = None
     if is_adaptive:
         if cfg.data.get("ref_models", None) is not None:
             raise ValueError(
@@ -690,10 +727,29 @@ def main(cfg: DictConfig):
             mode="test",
         )
     else:
+        original_reference_options = _original_reference_options(cfg)
+        original_ids_file = original_reference_options["ids_file"]
+        if original_ids_file is not None:
+            original_ids_file = to_absolute_path(original_ids_file)
+            if not Path(original_ids_file).is_file():
+                raise FileNotFoundError(
+                    f"Original reference ID file does not exist: {original_ids_file}"
+                )
         ref_dataloader = get_ref_dataloader(cfg.data, 
                                         cfg.data.ref_model,
-                                        mode="val",
-                                        resolution_size=cfg.data.resolution_size)
+                                        mode=original_reference_options["split"],
+                                        resolution_size=cfg.data.resolution_size,
+                                        load_len=original_reference_options["load_len"],
+                                        start_idx=original_reference_options["start_idx"],
+                                        ids_file=original_ids_file)
+        logger.info(
+            "Original fixed reference set: "
+            f"model={cfg.data.ref_model}, "
+            f"split={original_reference_options['split']}, "
+            f"start_idx={original_reference_options['start_idx']}, "
+            f"requested={original_reference_options['load_len']}, "
+            f"ids_file={original_ids_file}"
+        )
     if evaluation_mode == "real_only":
         real_model = str(cfg.real_only.real_model)
         real_split = str(cfg.real_only.split)
@@ -799,7 +855,11 @@ def main(cfg: DictConfig):
             cfg.data.ref_load_len,
         )
     else:
-        feature_ref, ref_data = get_ref_features(model, ref_dataloader, cfg.data.ref_load_len)
+        feature_ref, ref_data = get_ref_features(
+            model,
+            ref_dataloader,
+            original_reference_options["load_len"],
+        )
     if not is_adaptive:
         feature_ref = feature_ref.cuda()
     regression_model = None

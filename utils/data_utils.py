@@ -145,7 +145,8 @@ def get_ref_dataloaders(data_cfg, ref_model_names, mode="test", filter_frames=Fa
     return ref_dataloaders
 
 def get_ref_dataloader(data_cfg, ref_model_name, mode="test", filter_frames=False,
-                       resolution_size=224, load_len=100, return_video_id=False):
+                       resolution_size=224, load_len=100, start_idx=0,
+                       ids_file=None, return_video_id=False):
     ref_dataset = ScoreFeaturesDataset(
         score_config_path="./libs/eps_ad/imagnet.yml",
         score_args_path="./libs/eps_ad/args.yml",
@@ -163,6 +164,8 @@ def get_ref_dataloader(data_cfg, ref_model_name, mode="test", filter_frames=Fals
         filter_frames=filter_frames,
         resolution_size=resolution_size,
         load_len=load_len,
+        start_idx=start_idx,
+        ids_file=ids_file,
         return_video_id=return_video_id,
         )
     return DataLoader(ref_dataset, batch_size=data_cfg.batch_size,

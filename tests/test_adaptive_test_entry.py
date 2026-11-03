@@ -13,6 +13,7 @@ from test_dMMD import (
     _collect_query_clip_cache_requests,
     _evaluation_mode,
     _merge_clip_cache_requests,
+    _original_reference_options,
     _real_only_metrics,
     _reference_selection_mode,
     _score_original_real_query_loader,
@@ -176,6 +177,50 @@ class AdaptiveTestEntryTest(unittest.TestCase):
 
     def test_missing_reference_configuration_falls_back_to_original(self):
         self.assertEqual(_reference_selection_mode({}), "original")
+
+    def test_original_reference_options_preserve_legacy_defaults(self):
+        cfg = OmegaConf.create({"data": {"ref_load_len": 100}})
+
+        self.assertEqual(_original_reference_options(cfg), {
+            "split": "val",
+            "start_idx": 0,
+            "load_len": 100,
+            "ids_file": None,
+        })
+
+    def test_original_reference_options_accept_custom_selection(self):
+        cfg = OmegaConf.create({
+            "data": {"ref_load_len": 100},
+            "original_reference": {
+                "split": "test",
+                "start_idx": 200,
+                "load_len": 75,
+                "ids_file": "/tmp/reference_ids.txt",
+            },
+        })
+
+        self.assertEqual(_original_reference_options(cfg), {
+            "split": "test",
+            "start_idx": 200,
+            "load_len": 75,
+            "ids_file": "/tmp/reference_ids.txt",
+        })
+
+    def test_original_reference_options_reject_invalid_values(self):
+        invalid_configs = (
+            ({"split": "invalid", "start_idx": 0, "load_len": 100}, "split"),
+            ({"split": "val", "start_idx": -1, "load_len": 100}, "start_idx"),
+            ({"split": "val", "start_idx": 0, "load_len": 0}, "load_len"),
+            ({"split": "val", "start_idx": 0, "load_len": 100, "ids_file": ""}, "ids_file"),
+        )
+        for original_reference, message in invalid_configs:
+            cfg = OmegaConf.create({
+                "data": {"ref_load_len": 100},
+                "original_reference": original_reference,
+            })
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    _original_reference_options(cfg)
 
     def test_missing_evaluation_configuration_preserves_standard_mode(self):
         self.assertEqual(_evaluation_mode({}), "standard")

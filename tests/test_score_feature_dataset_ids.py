@@ -1,12 +1,15 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from data.feature_dataset.score_feature_dataset import ScoreFeaturesDataset
-from utils.data_utils import get_data_loaders_for_mmd
+from data.video_frames_dataset import VideoFramesDataset
+from utils.data_utils import get_data_loaders_for_mmd, get_ref_dataloader
 
 
 class _DataConfig:
@@ -70,6 +73,67 @@ class ScoreFeatureDatasetVideoIdTest(unittest.TestCase):
         self.assertIsInstance(ordered["real"].sampler, torch.utils.data.SequentialSampler)
         default = get_data_loaders_for_mmd(_DataConfig(), datasets, batch_size=20)
         self.assertIsInstance(default["real"].sampler, torch.utils.data.RandomSampler)
+
+    def test_reference_loader_forwards_custom_selection_options(self):
+        data_cfg = SimpleNamespace(
+            data_path="/data",
+            dataset_name="GenVideo",
+            diffuse_steps=5,
+            feature_type="velocity",
+            batch_size=24,
+            num_workers=0,
+        )
+        dataset_sentinel = _IndexedDataset(1)
+        with patch(
+                "utils.data_utils.ScoreFeaturesDataset",
+                return_value=dataset_sentinel) as dataset_class:
+            loader = get_ref_dataloader(
+                data_cfg,
+                "MSR-VTT",
+                mode="test",
+                load_len=80,
+                start_idx=20,
+                ids_file="/tmp/custom_ids.txt",
+                return_video_id=True,
+            )
+
+        kwargs = dataset_class.call_args.kwargs
+        self.assertEqual(kwargs["mode"], "test")
+        self.assertEqual(kwargs["load_len"], 80)
+        self.assertEqual(kwargs["start_idx"], 20)
+        self.assertEqual(kwargs["ids_file"], "/tmp/custom_ids.txt")
+        self.assertTrue(kwargs["return_video_id"])
+        self.assertIs(loader.dataset, dataset_sentinel)
+
+    def test_custom_id_file_accepts_ids_with_or_without_mp4_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            data_root = Path(temporary_dir) / "GenVideo"
+            ids_file = Path(temporary_dir) / "reference_ids.txt"
+            ids_file.write_text(
+                "Video_A\nvideo_b.mp4\n\n",
+                encoding="utf-8",
+            )
+            for video_id in ("Video_A", "video_b"):
+                frame_dir = (
+                    data_root
+                    / "video_frames/real/MSR-VTT/val"
+                    / video_id
+                )
+                frame_dir.mkdir(parents=True)
+                for frame_index in range(8):
+                    (frame_dir / f"frame{frame_index}.jpg").touch()
+
+            dataset = VideoFramesDataset(
+                data_path=str(data_root),
+                dataset_name="GenVideo",
+                generation_model="MSR-VTT",
+                mode="val",
+                len_load=2,
+                num_frames=8,
+                ids_file=str(ids_file),
+            )
+
+        self.assertEqual(dataset.video_ids, ["Video_A", "video_b"])
 
 
 if __name__ == "__main__":
