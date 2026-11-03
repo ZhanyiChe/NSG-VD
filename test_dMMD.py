@@ -502,6 +502,22 @@ def _score_adaptive_query_loader(
             query_clip_embeddings=query_clip_embeddings,
         )
         batch_scores = batch_result.scores.detach().cpu()
+        batch_mean_krr = batch_result.mean_krr.detach().cpu()
+        batch_mean_krq = batch_result.mean_krq.detach().cpu()
+        batch_kqq = batch_result.kqq.detach().cpu()
+        reconstructed_scores = batch_mean_krr - 2 * batch_mean_krq + batch_kqq
+        if not torch.allclose(
+                batch_scores,
+                reconstructed_scores,
+                rtol=1e-5,
+                atol=1e-6):
+            max_error = torch.max(
+                torch.abs(batch_scores - reconstructed_scores)
+            ).item()
+            raise RuntimeError(
+                "Adaptive MMD component reconstruction failed: "
+                f"maximum absolute error={max_error:.3e}"
+            )
         batch_predictions = (batch_scores > 1).int()
         scores.append(batch_scores)
 
@@ -511,6 +527,9 @@ def _score_adaptive_query_loader(
                 "query_id": query_id,
                 "query_label": query_label,
                 "mmd_score": float(batch_scores[index]),
+                "mean_krr": float(batch_mean_krr[index]),
+                "mean_krq": float(batch_mean_krq[index]),
+                "kqq": float(batch_kqq[index]),
                 "prediction": int(batch_predictions[index]),
                 "threshold": 1.0,
                 "reference_mode": selection_mode,

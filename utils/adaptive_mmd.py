@@ -17,6 +17,7 @@ implemented by the original code.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Union
 
 import torch
@@ -25,6 +26,16 @@ from utils.mmd_utils import MMD_batch2, Pdist2
 
 
 Scalar = Union[float, int, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class AdaptiveMMDComponents:
+    """Per-query terms of the biased one-sample-vs-reference MMD score."""
+
+    scores: torch.Tensor
+    mean_krr: torch.Tensor
+    mean_krq: torch.Tensor
+    kqq: torch.Tensor
 
 
 def _require_feature_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
@@ -295,7 +306,7 @@ def slow_adaptive_mmd_scores(
 
 
 @torch.no_grad()
-def fast_adaptive_mmd_scores(
+def fast_adaptive_mmd_components(
     candidate_deep: torch.Tensor,
     candidate_raw: torch.Tensor,
     query_deep: torch.Tensor,
@@ -306,8 +317,8 @@ def fast_adaptive_mmd_scores(
     sigma0: Scalar = 0.1,
     epsilon: Scalar = 1e-10,
     is_smooth: bool = True,
-) -> torch.Tensor:
-    """Score queries by indexing a precomputed candidate kernel matrix."""
+) -> AdaptiveMMDComponents:
+    """Return exact scores and their KRR, KRQ, and KQQ components."""
 
     (
         candidate_deep,
@@ -340,6 +351,9 @@ def fast_adaptive_mmd_scores(
         raise ValueError("candidate_kernel_matrix contains NaN or infinity")
 
     scores = []
+    mean_krr_values = []
+    mean_krq_values = []
+    kqq_values = []
     for query_index, reference_indices in enumerate(indices):
         reference_kernel = candidate_kernel_matrix.index_select(
             0, reference_indices
@@ -357,5 +371,45 @@ def fast_adaptive_mmd_scores(
         query_self_kernel = torch.ones(
             (), device=candidate_deep.device, dtype=candidate_deep.dtype
         )
-        scores.append(reference_kernel.mean() - 2 * cross_kernel.mean() + query_self_kernel)
-    return torch.stack(scores)
+        mean_krr = reference_kernel.mean()
+        mean_krq = cross_kernel.mean()
+        score = mean_krr - 2 * mean_krq + query_self_kernel
+        mean_krr_values.append(mean_krr)
+        mean_krq_values.append(mean_krq)
+        kqq_values.append(query_self_kernel)
+        scores.append(score)
+    return AdaptiveMMDComponents(
+        scores=torch.stack(scores),
+        mean_krr=torch.stack(mean_krr_values),
+        mean_krq=torch.stack(mean_krq_values),
+        kqq=torch.stack(kqq_values),
+    )
+
+
+@torch.no_grad()
+def fast_adaptive_mmd_scores(
+    candidate_deep: torch.Tensor,
+    candidate_raw: torch.Tensor,
+    query_deep: torch.Tensor,
+    query_raw: torch.Tensor,
+    selected_reference_indices: torch.Tensor,
+    candidate_kernel_matrix: torch.Tensor,
+    sigma: Scalar,
+    sigma0: Scalar = 0.1,
+    epsilon: Scalar = 1e-10,
+    is_smooth: bool = True,
+) -> torch.Tensor:
+    """Score queries by indexing a precomputed candidate kernel matrix."""
+
+    return fast_adaptive_mmd_components(
+        candidate_deep,
+        candidate_raw,
+        query_deep,
+        query_raw,
+        selected_reference_indices,
+        candidate_kernel_matrix,
+        sigma,
+        sigma0,
+        epsilon,
+        is_smooth=is_smooth,
+    ).scores

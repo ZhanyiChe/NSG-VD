@@ -5,7 +5,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from utils.adaptive_mmd import fast_adaptive_mmd_scores
+from utils.adaptive_mmd import fast_adaptive_mmd_components
 from utils.reference_selection import (
     ReferenceSelection,
     select_clip_bottomn,
@@ -48,6 +48,9 @@ class AdaptiveReferencePool:
 @dataclass(frozen=True)
 class AdaptiveBatchResult:
     scores: torch.Tensor
+    mean_krr: torch.Tensor
+    mean_krq: torch.Tensor
+    kqq: torch.Tensor
     selections: Tuple[Tuple[ReferenceSelection, ...], ...]
 
 
@@ -129,7 +132,7 @@ def select_and_score_adaptive_batch(
         dtype=torch.long,
         device=query_deep_features.device,
     )
-    scores = fast_adaptive_mmd_scores(
+    mmd = fast_adaptive_mmd_components(
         reference_pool.deep_features,
         reference_pool.raw_features,
         query_deep_features,
@@ -141,4 +144,10 @@ def select_and_score_adaptive_batch(
         epsilon,
         is_smooth=is_smooth,
     )
-    return AdaptiveBatchResult(scores=scores, selections=tuple(batch_selections))
+    return AdaptiveBatchResult(
+        scores=mmd.scores,
+        mean_krr=mmd.mean_krr,
+        mean_krq=mmd.mean_krq,
+        kqq=mmd.kqq,
+        selections=tuple(batch_selections),
+    )

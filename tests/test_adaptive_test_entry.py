@@ -109,6 +109,13 @@ class AdaptiveTestEntryTest(unittest.TestCase):
         self.assertEqual({row["query_label"] for row in query_rows}, {0, 1})
         self.assertTrue(all(row["reference_mode"] == "random_topn" for row in query_rows))
         self.assertTrue(all(row["checkpoint_hash"] == "abc123" for row in query_rows))
+        self.assertTrue(all(row["kqq"] == 1.0 for row in query_rows))
+        for row in query_rows:
+            self.assertAlmostEqual(
+                row["mmd_score"],
+                row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
+                places=6,
+            )
 
     def test_fixed_mode_uses_one_shared_reference_set(self):
         metrics, query_rows, selection_rows = test_adaptive_dMMD(

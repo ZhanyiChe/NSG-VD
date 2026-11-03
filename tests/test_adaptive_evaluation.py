@@ -78,6 +78,15 @@ class AdaptiveEvaluationTest(unittest.TestCase):
             self.epsilon,
         )
         torch.testing.assert_close(result.scores, expected, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(
+            result.scores,
+            result.mean_krr - 2 * result.mean_krq + result.kqq,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            result.kqq, torch.ones_like(result.kqq), rtol=0, atol=0
+        )
 
     def test_clip_bottom_selection_flows_into_exact_mmd_score(self):
         result = select_and_score_adaptive_batch(

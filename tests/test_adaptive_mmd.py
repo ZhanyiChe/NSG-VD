@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from utils.adaptive_mmd import (
+    fast_adaptive_mmd_components,
     fast_adaptive_mmd_scores,
     precompute_candidate_kernel_matrix,
     slow_adaptive_mmd_scores,
@@ -99,6 +100,40 @@ class AdaptiveMMDTest(unittest.TestCase):
             self.epsilon,
         )
         torch.testing.assert_close(fast, expected, rtol=1e-12, atol=1e-12)
+
+    def test_fast_components_exactly_reconstruct_each_score(self):
+        candidate_kernel = precompute_candidate_kernel_matrix(
+            self.candidate_deep,
+            self.candidate_raw,
+            self.sigma,
+            self.sigma0,
+            self.epsilon,
+            block_size=2,
+        )
+        components = fast_adaptive_mmd_components(
+            self.candidate_deep,
+            self.candidate_raw,
+            self.query_deep,
+            self.query_raw,
+            self.indices,
+            candidate_kernel,
+            self.sigma,
+            self.sigma0,
+            self.epsilon,
+        )
+
+        reconstructed = (
+            components.mean_krr - 2 * components.mean_krq + components.kqq
+        )
+        torch.testing.assert_close(
+            components.scores, reconstructed, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            components.kqq,
+            torch.ones_like(components.kqq),
+            rtol=0,
+            atol=0,
+        )
 
     def test_kernel_precomputation_is_independent_of_block_size(self):
         single_block = precompute_candidate_kernel_matrix(
