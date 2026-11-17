@@ -31,6 +31,8 @@ FIGURE_METRICS = (
     ("recall", "Recall", "#F28E2B", "s"),
     ("accuracy", "Accuracy", "#4E79A7", "^"),
     ("f1", "F1", "#E15759", "o"),
+    ("precision", "Precision", "#59A14F", "D"),
+    ("tnr", "Real Accuracy (TNR)", "#B07AA1", "v"),
 )
 
 
