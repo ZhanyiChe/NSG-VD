@@ -3,9 +3,11 @@ import unittest
 import pandas as pd
 
 from utils.threshold_scan import (
+    aggregate_real_only_runs,
     aggregate_run_macros,
     build_thresholds,
     macro_average_scan,
+    scan_real_only_query_scores,
     scan_query_scores,
 )
 
@@ -53,6 +55,40 @@ class ThresholdScanTest(unittest.TestCase):
         invalid = self.query_scores[self.query_scores["query_label"] == 0]
         with self.assertRaisesRegex(ValueError, "both real and fake"):
             scan_query_scores(invalid, [1.0])
+
+    def test_real_only_scan_requires_unique_real_queries(self):
+        real_only = pd.DataFrame({
+            "query_id": ["r0", "r1", "r2"],
+            "query_label": [0, 0, 0],
+            "mmd_score": [0.5, 1.0, 1.2],
+        })
+        scan = scan_real_only_query_scores(real_only, [1.0]).iloc[0]
+        self.assertEqual(scan["num_real"], 3)
+        self.assertAlmostEqual(scan["real_accuracy"], 2 / 3)
+        self.assertAlmostEqual(scan["fpr"], 1 / 3)
+
+        duplicated = pd.concat([real_only, real_only.iloc[[0]]], ignore_index=True)
+        with self.assertRaisesRegex(ValueError, "unique query_id"):
+            scan_real_only_query_scores(duplicated, [1.0])
+
+    def test_real_only_run_summary_uses_sample_standard_deviation(self):
+        first = pd.DataFrame({
+            "run_index": [0],
+            "threshold": [1.0],
+            "num_real": [500],
+            "real_accuracy": [0.8],
+            "fpr": [0.2],
+        })
+        second = pd.DataFrame({
+            "run_index": [1],
+            "threshold": [1.0],
+            "num_real": [500],
+            "real_accuracy": [0.9],
+            "fpr": [0.1],
+        })
+        summary = aggregate_real_only_runs([first, second]).iloc[0]
+        self.assertAlmostEqual(summary["real_accuracy_mean"], 0.85)
+        self.assertAlmostEqual(summary["real_accuracy_std"], 0.0707106781)
 
 
 if __name__ == "__main__":

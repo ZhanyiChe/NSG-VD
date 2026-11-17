@@ -23,6 +23,12 @@ THRESHOLD_METRICS = (
     "auroc",
 )
 
+REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS = frozenset({
+    "query_id",
+    "query_label",
+    "mmd_score",
+})
+
 
 def build_thresholds(start=0.4, stop=1.3, step=0.1):
     """Build an inclusive, decimal-stable threshold grid."""
@@ -132,6 +138,108 @@ def scan_query_scores(query_scores, thresholds):
                 **metrics,
             })
     return pd.DataFrame(rows)
+
+
+def validate_real_only_query_scores(query_scores):
+    """Validate a score file containing one row per unique real query."""
+
+    missing = REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS.difference(
+        query_scores.columns
+    )
+    if missing:
+        raise ValueError(
+            "real-only query score CSV is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+    if query_scores.empty:
+        raise ValueError("real-only query score CSV is empty")
+    if query_scores[
+        list(REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS)
+    ].isnull().any().any():
+        raise ValueError(
+            "real-only query score CSV contains null ID, label, or score values"
+        )
+
+    labels = set(pd.to_numeric(query_scores["query_label"]).astype(int).unique())
+    if labels != {0}:
+        raise ValueError("real-only query scores must contain only label 0 (real)")
+
+    duplicated_ids = query_scores["query_id"].astype(str).duplicated(keep=False)
+    if duplicated_ids.any():
+        duplicates = sorted(
+            query_scores.loc[duplicated_ids, "query_id"].astype(str).unique()
+        )
+        raise ValueError(
+            "real-only query score CSV must contain one row per unique query_id; "
+            f"first duplicates: {duplicates[:5]}"
+        )
+
+
+def scan_real_only_query_scores(query_scores, thresholds):
+    """Compute real accuracy over thresholds without duplicating real queries."""
+
+    validate_real_only_query_scores(query_scores)
+    thresholds = list(thresholds)
+    if not thresholds:
+        raise ValueError("at least one threshold is required")
+
+    scores = pd.to_numeric(query_scores["mmd_score"]).to_numpy(
+        dtype=np.float64
+    )
+    rows = []
+    for threshold in thresholds:
+        false_positive = int(np.sum(scores > float(threshold)))
+        true_negative = int(scores.size - false_positive)
+        rows.append({
+            "threshold": float(threshold),
+            "num_real": int(scores.size),
+            "real_accuracy": _safe_ratio(true_negative, scores.size),
+            "fpr": _safe_ratio(false_positive, scores.size),
+            "true_negative": true_negative,
+            "false_positive": false_positive,
+            "mean_mmd_score": float(scores.mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def aggregate_real_only_runs(real_only_scans):
+    """Aggregate unique-query real-only scans across repeated random runs."""
+
+    if not real_only_scans:
+        raise ValueError("at least one real-only scan is required")
+    combined = pd.concat(real_only_scans, ignore_index=True)
+    required = {"threshold", "run_index", "num_real", "real_accuracy", "fpr"}
+    missing = required.difference(combined.columns)
+    if missing:
+        raise ValueError(
+            "real-only scan is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    rows = []
+    for threshold, group in combined.groupby("threshold", sort=True):
+        num_real_values = group["num_real"].astype(int).unique()
+        if num_real_values.size != 1:
+            raise ValueError(
+                "all real-only runs for a strategy must use the same number "
+                "of unique real queries"
+            )
+        accuracy = group["real_accuracy"].to_numpy(dtype=np.float64)
+        fpr = group["fpr"].to_numpy(dtype=np.float64)
+        rows.append({
+            "threshold": float(threshold),
+            "num_runs": int(group["run_index"].nunique()),
+            "num_real": int(num_real_values[0]),
+            "real_accuracy_mean": float(accuracy.mean()),
+            "real_accuracy_std": (
+                float(accuracy.std(ddof=1)) if accuracy.size > 1 else 0.0
+            ),
+            "real_fpr_mean": float(fpr.mean()),
+            "real_fpr_std": (
+                float(fpr.std(ddof=1)) if fpr.size > 1 else 0.0
+            ),
+        })
+    return pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
 
 
 def macro_average_scan(per_generator_scan):

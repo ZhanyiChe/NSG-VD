@@ -20,9 +20,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.threshold_scan import (  # noqa: E402
     THRESHOLD_METRICS,
+    aggregate_real_only_runs,
     aggregate_run_macros,
     build_thresholds,
     macro_average_scan,
+    scan_real_only_query_scores,
     scan_query_scores,
 )
 
@@ -32,7 +34,7 @@ FIGURE_METRICS = (
     ("accuracy", "Accuracy", "#4E79A7", "^"),
     ("f1", "F1", "#E15759", "o"),
     ("precision", "Precision", "#59A14F", "D"),
-    ("tnr", "Real Accuracy (TNR)", "#B07AA1", "v"),
+    ("real_accuracy", "Real Accuracy (TNR)", "#B07AA1", "v"),
 )
 
 
@@ -74,6 +76,23 @@ def _parse_args():
         default=[],
         metavar="LABEL=CSV1,CSV2,...",
         help="add repeated runs such as five random seeds",
+    )
+    parser.add_argument(
+        "--real-only-run",
+        action="append",
+        default=[],
+        metavar="LABEL=CSV",
+        help=(
+            "add one unique-query real-only score file for a --run strategy; "
+            "when omitted, Real Accuracy falls back to the paired score file"
+        ),
+    )
+    parser.add_argument(
+        "--real-only-group",
+        action="append",
+        default=[],
+        metavar="LABEL=CSV1,CSV2,...",
+        help="add repeated real-only runs matching a --group strategy",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--threshold-start", type=float, default=0.4)
@@ -143,6 +162,67 @@ def _scan_experiments(experiments, thresholds):
         pd.concat(per_run_outputs, ignore_index=True),
         pd.concat(strategy_outputs, ignore_index=True),
     )
+
+
+def _scan_real_only_experiments(experiments, thresholds):
+    per_run_outputs = []
+    strategy_outputs = []
+
+    for strategy, paths in experiments:
+        run_scans = []
+        for run_index, path in enumerate(paths):
+            query_scores = pd.read_csv(path)
+            run_scan = scan_real_only_query_scores(query_scores, thresholds)
+            run_scan.insert(0, "source_csv", str(path))
+            run_scan.insert(0, "run_index", run_index)
+            run_scan.insert(0, "strategy", strategy)
+            per_run_outputs.append(run_scan)
+            run_scans.append(run_scan)
+
+        strategy_summary = aggregate_real_only_runs(run_scans)
+        strategy_summary.insert(0, "strategy", strategy)
+        strategy_outputs.append(strategy_summary)
+
+    return (
+        pd.concat(per_run_outputs, ignore_index=True),
+        pd.concat(strategy_outputs, ignore_index=True),
+    )
+
+
+def _attach_real_accuracy(summary, standard_experiments, real_only_experiments):
+    result = summary.copy()
+    if not real_only_experiments:
+        result["real_accuracy_mean"] = result["tnr_mean"]
+        result["real_accuracy_std"] = result["tnr_std"]
+        return result, None, None
+
+    standard_labels = [label for label, _ in standard_experiments]
+    real_only_labels = [label for label, _ in real_only_experiments]
+    if set(standard_labels) != set(real_only_labels):
+        missing = sorted(set(standard_labels).difference(real_only_labels))
+        extra = sorted(set(real_only_labels).difference(standard_labels))
+        raise ValueError(
+            "real-only strategy labels must exactly match standard strategy "
+            f"labels; missing={missing}, extra={extra}"
+        )
+
+    real_only_runs, real_only_summary = _scan_real_only_experiments(
+        real_only_experiments,
+        sorted(result["threshold"].unique()),
+    )
+    real_only_for_merge = real_only_summary.rename(columns={
+        "num_runs": "real_only_num_runs",
+        "num_real": "real_only_num_queries",
+    })
+    result = result.merge(
+        real_only_for_merge,
+        on=["strategy", "threshold"],
+        how="left",
+        validate="one_to_one",
+    )
+    if result["real_accuracy_mean"].isnull().any():
+        raise ValueError("failed to match every strategy and threshold to real-only data")
+    return result, real_only_runs, real_only_summary
 
 
 def _resolve_y_limits(summary, y_min, y_max):
@@ -219,18 +299,36 @@ def _plot_figure3(summary, strategy_order, output_dir, title, dpi, y_min, y_max)
 def main():
     args = _parse_args()
     experiments = _load_experiments(args.run, args.group)
+    real_only_experiments = _load_experiments(
+        args.real_only_run,
+        args.real_only_group,
+    ) if (args.real_only_run or args.real_only_group) else []
     thresholds = build_thresholds(
         args.threshold_start,
         args.threshold_stop,
         args.threshold_step,
     )
     per_generator, per_run, summary = _scan_experiments(experiments, thresholds)
+    summary, real_only_runs, real_only_summary = _attach_real_accuracy(
+        summary,
+        experiments,
+        real_only_experiments,
+    )
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     per_generator.to_csv(output_dir / "threshold_scan_by_generator.csv", index=False)
     per_run.to_csv(output_dir / "threshold_scan_by_run_macro.csv", index=False)
     summary.to_csv(output_dir / "threshold_scan_macro.csv", index=False)
+    if real_only_runs is not None:
+        real_only_runs.to_csv(
+            output_dir / "threshold_scan_real_only_by_run.csv",
+            index=False,
+        )
+        real_only_summary.to_csv(
+            output_dir / "threshold_scan_real_only.csv",
+            index=False,
+        )
     _plot_figure3(
         summary,
         [label for label, _ in experiments],
@@ -245,6 +343,9 @@ def main():
     print(f"Saved: {output_dir / 'threshold_scan_by_generator.csv'}")
     print(f"Saved: {output_dir / 'threshold_scan_by_run_macro.csv'}")
     print(f"Saved: {output_dir / 'threshold_scan_macro.csv'}")
+    if real_only_runs is not None:
+        print(f"Saved: {output_dir / 'threshold_scan_real_only_by_run.csv'}")
+        print(f"Saved: {output_dir / 'threshold_scan_real_only.csv'}")
     print(f"Saved: {output_dir / 'threshold_scan_figure3.png'}")
     print(f"Saved: {output_dir / 'threshold_scan_figure3.pdf'}")
     at_default = summary[np.isclose(summary["threshold"], 1.0)]
@@ -254,6 +355,7 @@ def main():
             "recall_mean",
             "accuracy_mean",
             "f1_mean",
+            "real_accuracy_mean",
             "auroc_mean",
         ]
         print("\nMetrics at threshold 1.0:")
