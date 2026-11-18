@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import FormatStrFormatter
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -250,6 +251,14 @@ def _plot_figure3(summary, strategy_order, output_dir, title, dpi, y_min, y_max)
         sharey=True,
     )
     y_min, y_max = _resolve_y_limits(summary, y_min, y_max)
+    threshold_min = float(summary["threshold"].min())
+    threshold_max = float(summary["threshold"].max())
+    x_tick_start = math.ceil((threshold_min - 1e-9) * 10) / 10
+    x_tick_stop = math.floor((threshold_max + 1e-9) * 10) / 10
+    x_ticks = np.arange(x_tick_start, x_tick_stop + 0.05, 0.1)
+    y_tick_start = math.ceil((y_min - 1e-9) * 10) / 10
+    y_tick_stop = math.floor((y_max + 1e-9) * 10) / 10
+    y_ticks = np.arange(y_tick_start, y_tick_stop + 0.05, 0.1)
 
     for axis, strategy in zip(axes.flat, strategy_order):
         current = summary[summary["strategy"] == strategy].sort_values("threshold")
@@ -281,7 +290,12 @@ def _plot_figure3(summary, strategy_order, output_dir, title, dpi, y_min, y_max)
         axis.axvline(1.0, color="#666666", linestyle="--", linewidth=1.2)
         axis.set_title(strategy)
         axis.set_ylim(y_min, y_max)
-        axis.set_xticks(thresholds)
+        axis.set_xticks(x_ticks)
+        axis.set_yticks(y_ticks)
+        axis.xaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+        axis.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+        axis.tick_params(axis="x", which="both", labelbottom=True)
+        axis.tick_params(axis="y", which="both", labelleft=True)
         axis.grid(True, linestyle="--", alpha=0.3)
         axis.set_xlabel(r"Decision threshold $\tau$")
         axis.set_ylabel("Macro-average value")
