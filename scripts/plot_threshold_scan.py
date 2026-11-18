@@ -298,7 +298,7 @@ def _plot_figure3(summary, strategy_order, output_dir, title, dpi, y_min, y_max)
         axis.tick_params(axis="y", which="both", labelleft=True)
         axis.grid(True, linestyle="--", alpha=0.3)
         axis.set_xlabel(r"Decision threshold $\tau$")
-        axis.set_ylabel("Macro-average value")
+        axis.set_ylabel("Value")
         axis.legend(loc="best")
 
     for axis in axes.flat[len(strategy_order):]:
