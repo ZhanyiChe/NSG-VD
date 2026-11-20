@@ -135,6 +135,39 @@ class AdaptiveMMDTest(unittest.TestCase):
             atol=0,
         )
 
+    def test_original_mmd_optional_components_do_not_change_scores(self):
+        reference_indices = torch.tensor([0, 2, 4, 6])
+        reference_deep = self.candidate_deep.index_select(0, reference_indices)
+        reference_raw = self.candidate_raw.index_select(0, reference_indices)
+        combined_deep = torch.cat((reference_deep, self.query_deep))
+        combined_raw = torch.cat((reference_raw, self.query_raw)).flatten(1)
+
+        default_scores = MMD_batch2(
+            combined_deep,
+            reference_deep.shape[0],
+            combined_raw,
+            self.sigma,
+            self.sigma0,
+            self.epsilon,
+        )
+        scores, mean_krr, mean_krq, kqq = MMD_batch2(
+            combined_deep,
+            reference_deep.shape[0],
+            combined_raw,
+            self.sigma,
+            self.sigma0,
+            self.epsilon,
+            return_components=True,
+        )
+
+        torch.testing.assert_close(scores, default_scores, rtol=0, atol=0)
+        torch.testing.assert_close(
+            scores,
+            mean_krr - 2 * mean_krq + kqq,
+            rtol=0,
+            atol=0,
+        )
+
     def test_kernel_precomputation_is_independent_of_block_size(self):
         single_block = precompute_candidate_kernel_matrix(
             self.candidate_deep,

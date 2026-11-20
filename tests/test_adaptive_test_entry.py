@@ -174,6 +174,12 @@ class AdaptiveTestEntryTest(unittest.TestCase):
         self.assertTrue(all(row["reference_mode"] == "original" for row in query_rows))
         self.assertTrue(all(row["top_n"] == 2 for row in query_rows))
         self.assertTrue(all(row["checkpoint_hash"] == "abc123" for row in query_rows))
+        for row in query_rows:
+            self.assertAlmostEqual(
+                row["mmd_score"],
+                row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
+                places=6,
+            )
 
     def test_missing_reference_configuration_falls_back_to_original(self):
         self.assertEqual(_reference_selection_mode({}), "original")
@@ -336,6 +342,12 @@ class AdaptiveTestEntryTest(unittest.TestCase):
         self.assertEqual({row["query_label"] for row in rows}, {0})
         self.assertEqual({row["query_id"] for row in rows}, {"real_0", "real_1"})
         self.assertTrue(all(row["reference_mode"] == "original" for row in rows))
+        for row in rows:
+            self.assertAlmostEqual(
+                row["mmd_score"],
+                row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
+                places=6,
+            )
 
 
 if __name__ == "__main__":

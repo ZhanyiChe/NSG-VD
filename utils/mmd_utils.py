@@ -249,7 +249,7 @@ def MMD_batch(Fea, len_s, Fea_org, sigma, sigma0=0.1, epsilon = 10**(-10), is_sm
 		dis_vector[i] = MMDu(torch.cat((X_fea,Y_fea[[i]]),dim=0), len_s, torch.cat((X,Y[[i]]),dim=0).view(len_s+1,-1), sigma, sigma0, epsilon, is_unbiased=False)[0]
 	return dis_vector
 
-def MMD_batch2(Fea, len_s, Fea_org, sigma, sigma0=0.1, epsilon = 10**(-10), is_smooth=True, is_var_computed=True, use_1sample_U=True, coeff_xy=2):
+def MMD_batch2(Fea, len_s, Fea_org, sigma, sigma0=0.1, epsilon = 10**(-10), is_smooth=True, is_var_computed=True, use_1sample_U=True, coeff_xy=2, return_components=False):
 	X = Fea[0:len_s, :] # 400,300
 	Y = Fea[len_s:, :] # 2000,300
 	if is_smooth:
@@ -292,6 +292,8 @@ def MMD_batch2(Fea, len_s, Fea_org, sigma, sigma0=0.1, epsilon = 10**(-10), is_s
 		xy = torch.div(torch.sum(Kxy, dim = 1), (nx )) # 2000
 		
 		mmd2 = xx - 2 * xy + yy
+	if return_components:
+		return mmd2, xx.expand_as(mmd2), xy, yy
 	return mmd2
 
 def compute_mmd(X, Y, sigma):

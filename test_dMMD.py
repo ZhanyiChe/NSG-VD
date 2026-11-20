@@ -609,6 +609,9 @@ def _score_original_real_query_loader(
     model.eval()
     device = next(model.parameters()).device
     scores = []
+    mean_krr_values = []
+    mean_krq_values = []
+    kqq_values = []
     query_ids = []
     for batch in tqdm(
             query_dataloader,
@@ -621,7 +624,7 @@ def _score_original_real_query_loader(
             raise ValueError("real-only query loader contains non-real labels")
         inputs = inputs.float().to(device)
         _, deep_features = model.net(inputs, out_feature=True)
-        batch_scores = MMD_batch2(
+        batch_result = MMD_batch2(
             torch.cat([feature_ref, deep_features], dim=0),
             feature_ref.shape[0],
             torch.cat([ref_data, inputs], dim=0).view(
@@ -631,24 +634,45 @@ def _score_original_real_query_loader(
             model.sigma0_u,
             model.ep,
             is_smooth=model.is_smooth,
-        ).cpu()
+            return_components=True,
+        )
+        (
+            batch_scores,
+            batch_mean_krr,
+            batch_mean_krq,
+            batch_kqq,
+        ) = (value.cpu() for value in batch_result)
         scores.append(batch_scores)
+        mean_krr_values.append(batch_mean_krr)
+        mean_krq_values.append(batch_mean_krq)
+        kqq_values.append(batch_kqq)
         query_ids.extend(str(video_id) for video_id in batch_ids)
 
     if not scores:
         raise RuntimeError(f"real-only query loader is empty for {dataset_name}")
     scores = torch.cat(scores)
+    mean_krr_values = torch.cat(mean_krr_values)
+    mean_krq_values = torch.cat(mean_krq_values)
+    kqq_values = torch.cat(kqq_values)
     if len(query_ids) != len(scores):
         raise RuntimeError("real-only video IDs and original MMD scores are misaligned")
     metrics = _real_only_metrics(scores, regression_model)
     rows = []
-    for query_id, score, prediction in zip(
-            query_ids, scores, metrics["predictions"]):
+    for query_id, score, mean_krr, mean_krq, kqq, prediction in zip(
+            query_ids,
+            scores,
+            mean_krr_values,
+            mean_krq_values,
+            kqq_values,
+            metrics["predictions"]):
         rows.append({
             "generator": dataset_name,
             "query_id": query_id,
             "query_label": 0,
             "mmd_score": float(score),
+            "mean_krr": float(mean_krr),
+            "mean_krq": float(mean_krq),
+            "kqq": float(kqq),
             "prediction": int(prediction),
             "threshold": 1.0,
             "reference_mode": "original",
@@ -1088,6 +1112,12 @@ def test_dMMD(
     real_dataloader = test_dataloader["real"]
     dt_clean = []
     dt_adv = []
+    real_mean_krr = []
+    real_mean_krq = []
+    real_kqq = []
+    fake_mean_krr = []
+    fake_mean_krq = []
+    fake_kqq = []
     real_ids = []
     fake_ids = []
     device = next(model.parameters()).device
@@ -1111,9 +1141,42 @@ def test_dMMD(
             
             _,feature_cln = net(x_real,out_feature=True)
             _,feature_adv = net(x_fake,out_feature=True)
-            dt_clean.append(MMD_batch2(torch.cat([feature_ref,feature_cln],dim=0), feature_ref.shape[0], torch.cat([ref_data,x_real],dim=0).view(ref_data.shape[0]+x_real.shape[0],-1), sigma, sigma0_u, ep, is_smooth=is_smooth).cpu())
-            
-            dt_adv.append(MMD_batch2(torch.cat([feature_ref,feature_adv],dim=0), feature_ref.shape[0], torch.cat([ref_data,x_fake],dim=0).view(ref_data.shape[0]+x_fake.shape[0],-1), sigma, sigma0_u, ep, is_smooth=is_smooth).cpu())
+            real_result = MMD_batch2(
+                torch.cat([feature_ref,feature_cln],dim=0),
+                feature_ref.shape[0],
+                torch.cat([ref_data,x_real],dim=0).view(
+                    ref_data.shape[0]+x_real.shape[0],-1),
+                sigma,
+                sigma0_u,
+                ep,
+                is_smooth=is_smooth,
+                return_components=return_query_rows,
+            )
+            fake_result = MMD_batch2(
+                torch.cat([feature_ref,feature_adv],dim=0),
+                feature_ref.shape[0],
+                torch.cat([ref_data,x_fake],dim=0).view(
+                    ref_data.shape[0]+x_fake.shape[0],-1),
+                sigma,
+                sigma0_u,
+                ep,
+                is_smooth=is_smooth,
+                return_components=return_query_rows,
+            )
+            if return_query_rows:
+                clean_scores, clean_krr, clean_krq, clean_kqq = real_result
+                adv_scores, adv_krr, adv_krq, adv_kqq = fake_result
+                real_mean_krr.append(clean_krr.cpu())
+                real_mean_krq.append(clean_krq.cpu())
+                real_kqq.append(clean_kqq.cpu())
+                fake_mean_krr.append(adv_krr.cpu())
+                fake_mean_krq.append(adv_krq.cpu())
+                fake_kqq.append(adv_kqq.cpu())
+            else:
+                clean_scores = real_result
+                adv_scores = fake_result
+            dt_clean.append(clean_scores.cpu())
+            dt_adv.append(adv_scores.cpu())
 
         dt_clean = torch.cat(dt_clean)
         dt_adv = torch.cat(dt_adv)
@@ -1148,18 +1211,57 @@ def test_dMMD(
     if len(real_ids) != len(dt_clean) or len(fake_ids) != len(dt_adv):
         raise RuntimeError("recorded video IDs and original MMD scores are misaligned")
 
+    real_mean_krr = torch.cat(real_mean_krr)
+    real_mean_krq = torch.cat(real_mean_krq)
+    real_kqq = torch.cat(real_kqq)
+    fake_mean_krr = torch.cat(fake_mean_krr)
+    fake_mean_krq = torch.cat(fake_mean_krq)
+    fake_kqq = torch.cat(fake_kqq)
+
     predictions = torch.as_tensor(predict).reshape(-1).cpu()
     query_rows = []
-    for query_label, query_ids, query_scores, query_predictions in (
-            (0, real_ids, dt_clean, predictions[:len(dt_clean)]),
-            (1, fake_ids, dt_adv, predictions[len(dt_clean):])):
-        for query_id, score, prediction in zip(
-                query_ids, query_scores, query_predictions):
+    for (
+            query_label,
+            query_ids,
+            query_scores,
+            query_mean_krr,
+            query_mean_krq,
+            query_kqq,
+            query_predictions,
+    ) in (
+            (
+                0,
+                real_ids,
+                dt_clean,
+                real_mean_krr,
+                real_mean_krq,
+                real_kqq,
+                predictions[:len(dt_clean)],
+            ),
+            (
+                1,
+                fake_ids,
+                dt_adv,
+                fake_mean_krr,
+                fake_mean_krq,
+                fake_kqq,
+                predictions[len(dt_clean):],
+            )):
+        for query_id, score, mean_krr, mean_krq, kqq, prediction in zip(
+                query_ids,
+                query_scores,
+                query_mean_krr,
+                query_mean_krq,
+                query_kqq,
+                query_predictions):
             query_rows.append({
                 "generator": generator_name,
                 "query_id": query_id,
                 "query_label": query_label,
                 "mmd_score": float(score),
+                "mean_krr": float(mean_krr),
+                "mean_krq": float(mean_krq),
+                "kqq": float(kqq),
                 "prediction": int(prediction),
                 "threshold": 1.0,
                 "reference_mode": "original",
