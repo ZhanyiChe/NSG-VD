@@ -10,7 +10,6 @@ from sklearn.metrics import roc_auc_score
 REQUIRED_QUERY_SCORE_COLUMNS = frozenset({
     "generator",
     "query_label",
-    "mmd_score",
 })
 
 THRESHOLD_METRICS = (
@@ -26,7 +25,6 @@ THRESHOLD_METRICS = (
 REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS = frozenset({
     "query_id",
     "query_label",
-    "mmd_score",
 })
 
 
@@ -88,8 +86,9 @@ def _binary_metrics(labels, scores, threshold):
     }
 
 
-def validate_query_scores(query_scores):
-    missing = REQUIRED_QUERY_SCORE_COLUMNS.difference(query_scores.columns)
+def validate_query_scores(query_scores, score_column="mmd_score"):
+    required_columns = REQUIRED_QUERY_SCORE_COLUMNS.union({score_column})
+    missing = required_columns.difference(query_scores.columns)
     if missing:
         raise ValueError(
             "query score CSV is missing required columns: "
@@ -97,7 +96,7 @@ def validate_query_scores(query_scores):
         )
     if query_scores.empty:
         raise ValueError("query score CSV is empty")
-    if query_scores[list(REQUIRED_QUERY_SCORE_COLUMNS)].isnull().any().any():
+    if query_scores[list(required_columns)].isnull().any().any():
         raise ValueError("query score CSV contains null generator, label, or score values")
 
     labels = set(pd.to_numeric(query_scores["query_label"]).astype(int).unique())
@@ -114,10 +113,10 @@ def validate_query_scores(query_scores):
             )
 
 
-def scan_query_scores(query_scores, thresholds):
+def scan_query_scores(query_scores, thresholds, score_column="mmd_score"):
     """Compute threshold-dependent metrics independently for each generator."""
 
-    validate_query_scores(query_scores)
+    validate_query_scores(query_scores, score_column=score_column)
     thresholds = list(thresholds)
     if not thresholds:
         raise ValueError("at least one threshold is required")
@@ -125,13 +124,14 @@ def scan_query_scores(query_scores, thresholds):
     rows = []
     for generator, group in query_scores.groupby("generator", sort=False):
         labels = pd.to_numeric(group["query_label"]).to_numpy(dtype=np.int64)
-        scores = pd.to_numeric(group["mmd_score"]).to_numpy(dtype=np.float64)
+        scores = pd.to_numeric(group[score_column]).to_numpy(dtype=np.float64)
         num_real = int(np.sum(labels == 0))
         num_fake = int(np.sum(labels == 1))
         for threshold in thresholds:
             metrics = _binary_metrics(labels, scores, float(threshold))
             rows.append({
                 "generator": str(generator),
+                "score_column": score_column,
                 "threshold": float(threshold),
                 "num_real": num_real,
                 "num_fake": num_fake,
@@ -140,10 +140,11 @@ def scan_query_scores(query_scores, thresholds):
     return pd.DataFrame(rows)
 
 
-def validate_real_only_query_scores(query_scores):
+def validate_real_only_query_scores(query_scores, score_column="mmd_score"):
     """Validate a score file containing one row per unique real query."""
 
-    missing = REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS.difference(
+    required_columns = REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS.union({score_column})
+    missing = required_columns.difference(
         query_scores.columns
     )
     if missing:
@@ -154,7 +155,7 @@ def validate_real_only_query_scores(query_scores):
     if query_scores.empty:
         raise ValueError("real-only query score CSV is empty")
     if query_scores[
-        list(REAL_ONLY_REQUIRED_QUERY_SCORE_COLUMNS)
+        list(required_columns)
     ].isnull().any().any():
         raise ValueError(
             "real-only query score CSV contains null ID, label, or score values"
@@ -175,15 +176,18 @@ def validate_real_only_query_scores(query_scores):
         )
 
 
-def scan_real_only_query_scores(query_scores, thresholds):
+def scan_real_only_query_scores(
+        query_scores,
+        thresholds,
+        score_column="mmd_score"):
     """Compute real accuracy over thresholds without duplicating real queries."""
 
-    validate_real_only_query_scores(query_scores)
+    validate_real_only_query_scores(query_scores, score_column=score_column)
     thresholds = list(thresholds)
     if not thresholds:
         raise ValueError("at least one threshold is required")
 
-    scores = pd.to_numeric(query_scores["mmd_score"]).to_numpy(
+    scores = pd.to_numeric(query_scores[score_column]).to_numpy(
         dtype=np.float64
     )
     rows = []
@@ -192,12 +196,19 @@ def scan_real_only_query_scores(query_scores, thresholds):
         true_negative = int(scores.size - false_positive)
         rows.append({
             "threshold": float(threshold),
+            "score_column": score_column,
             "num_real": int(scores.size),
             "real_accuracy": _safe_ratio(true_negative, scores.size),
             "fpr": _safe_ratio(false_positive, scores.size),
             "true_negative": true_negative,
             "false_positive": false_positive,
-            "mean_mmd_score": float(scores.mean()),
+            "mean_score": float(scores.mean()),
+            "mean_mmd_score": (
+                float(scores.mean()) if score_column == "mmd_score" else np.nan
+            ),
+            "mean_decision_score": (
+                float(scores.mean()) if score_column == "decision_score" else np.nan
+            ),
         })
     return pd.DataFrame(rows)
 

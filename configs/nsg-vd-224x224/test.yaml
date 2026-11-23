@@ -64,6 +64,10 @@ original_reference:
 evaluation:
   mode: "standard" # standard | real_only
 
+scoring:
+  mode: "mmd" # mmd | krq_only
+  threshold: 1.0
+
 real_only:
   real_model: "${data.test_real_model}"
   split: "test" # train | val | test

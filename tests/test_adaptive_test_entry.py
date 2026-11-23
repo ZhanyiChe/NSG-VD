@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from omegaconf import OmegaConf
 
 from test_dMMD import (
+    _build_decision_scores,
     _cache_query_clip_features,
     _collect_query_clip_cache_requests,
     _evaluation_mode,
@@ -16,6 +17,7 @@ from test_dMMD import (
     _original_reference_options,
     _real_only_metrics,
     _reference_selection_mode,
+    _scoring_options,
     _score_original_real_query_loader,
     test_adaptive_dMMD,
     test_dMMD as run_legacy_dMMD,
@@ -117,6 +119,40 @@ class AdaptiveTestEntryTest(unittest.TestCase):
                 row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
                 places=6,
             )
+            self.assertAlmostEqual(row["decision_score"], row["mmd_score"])
+            self.assertEqual(row["score_mode"], "mmd")
+            self.assertEqual(row["threshold"], 1.0)
+
+    def test_krq_only_uses_one_minus_mean_krq_without_overwriting_mmd(self):
+        threshold = 0.35
+        metrics, query_rows, _ = test_adaptive_dMMD(
+            self.model,
+            self.loaders,
+            self.pool,
+            "random_topn",
+            self.selection_cfg,
+            "SyntheticGenerator",
+            "/tmp/checkpoint.pth",
+            "abc123",
+            scoring_mode="krq_only",
+            scoring_threshold=threshold,
+        )
+
+        self.assertEqual(set(metrics), {"precision", "recall", "f1", "accuracy", "auroc"})
+        for row in query_rows:
+            self.assertAlmostEqual(
+                row["mmd_score"],
+                row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
+                places=6,
+            )
+            self.assertAlmostEqual(
+                row["decision_score"],
+                1.0 - row["mean_krq"],
+                places=6,
+            )
+            self.assertEqual(row["prediction"], int(row["decision_score"] > threshold))
+            self.assertEqual(row["score_mode"], "krq_only")
+            self.assertEqual(row["threshold"], threshold)
 
     def test_fixed_mode_uses_one_shared_reference_set(self):
         metrics, query_rows, selection_rows = test_adaptive_dMMD(
@@ -180,6 +216,37 @@ class AdaptiveTestEntryTest(unittest.TestCase):
                 row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
                 places=6,
             )
+            self.assertAlmostEqual(row["decision_score"], row["mmd_score"])
+            self.assertEqual(row["score_mode"], "mmd")
+
+    def test_original_mode_supports_krq_only_without_changing_mmd_components(self):
+        threshold = 0.35
+        _, query_rows = run_legacy_dMMD(
+            self.model,
+            self.loaders,
+            self.pool.deep_features[:2],
+            self.pool.raw_features[:2],
+            return_query_rows=True,
+            generator_name="SyntheticGenerator",
+            checkpoint_path="/tmp/checkpoint.pth",
+            checkpoint_hash="abc123",
+            scoring_mode="krq_only",
+            scoring_threshold=threshold,
+        )
+
+        for row in query_rows:
+            self.assertAlmostEqual(
+                row["mmd_score"],
+                row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
+                places=6,
+            )
+            self.assertAlmostEqual(
+                row["decision_score"],
+                1.0 - row["mean_krq"],
+                places=6,
+            )
+            self.assertEqual(row["prediction"], int(row["decision_score"] > threshold))
+            self.assertEqual(row["score_mode"], "krq_only")
 
     def test_missing_reference_configuration_falls_back_to_original(self):
         self.assertEqual(_reference_selection_mode({}), "original")
@@ -230,6 +297,38 @@ class AdaptiveTestEntryTest(unittest.TestCase):
 
     def test_missing_evaluation_configuration_preserves_standard_mode(self):
         self.assertEqual(_evaluation_mode({}), "standard")
+
+    def test_missing_scoring_configuration_preserves_legacy_mmd(self):
+        self.assertEqual(_scoring_options({}), ("mmd", 1.0))
+
+    def test_scoring_configuration_accepts_krq_only_and_custom_threshold(self):
+        cfg = OmegaConf.create({
+            "scoring": {"mode": "krq_only", "threshold": 0.42},
+        })
+
+        self.assertEqual(_scoring_options(cfg), ("krq_only", 0.42))
+
+    def test_scoring_configuration_rejects_unknown_mode_and_nonfinite_threshold(self):
+        with self.assertRaisesRegex(ValueError, "scoring.mode"):
+            _scoring_options(OmegaConf.create({
+                "scoring": {"mode": "unknown", "threshold": 1.0},
+            }))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            _scoring_options(OmegaConf.create({
+                "scoring": {"mode": "mmd", "threshold": float("nan")},
+            }))
+
+    def test_decision_score_builder_preserves_mmd_and_transforms_krq(self):
+        mmd_scores = torch.tensor([0.2, 1.3])
+        mean_krq = torch.tensor([0.8, 0.25])
+
+        self.assertIs(_build_decision_scores(mmd_scores, mean_krq, "mmd"), mmd_scores)
+        torch.testing.assert_close(
+            _build_decision_scores(mmd_scores, mean_krq, "krq_only"),
+            torch.tensor([0.2, 0.75]),
+        )
+        with self.assertRaisesRegex(ValueError, "requires mean_krq"):
+            _build_decision_scores(mmd_scores, None, "krq_only")
 
     def test_clip_cache_requests_merge_repeated_real_queries(self):
         requests = _merge_clip_cache_requests([
@@ -322,6 +421,15 @@ class AdaptiveTestEntryTest(unittest.TestCase):
         self.assertEqual(metrics["fpr"], 0.5)
         self.assertAlmostEqual(metrics["mean_mmd_score"], 1.075)
 
+    def test_real_only_metrics_use_configured_threshold(self):
+        metrics = _real_only_metrics(
+            torch.tensor([0.2, 0.5, 0.7]),
+            threshold=0.5,
+        )
+
+        self.assertEqual(metrics["true_negatives"], 2)
+        self.assertEqual(metrics["false_positives"], 1)
+
     def test_original_real_only_scorer_returns_one_row_per_real_query(self):
         real = torch.tensor([[[0.1, 0.0]], [[0.3, 0.2]]])
         loader = DataLoader(_QueryDataset(real, 0, "real"), batch_size=2)
@@ -348,6 +456,41 @@ class AdaptiveTestEntryTest(unittest.TestCase):
                 row["mean_krr"] - 2 * row["mean_krq"] + row["kqq"],
                 places=6,
             )
+
+    def test_original_real_only_scorer_supports_krq_only(self):
+        real = torch.tensor([[[0.1, 0.0]], [[0.3, 0.2]]])
+        loader = DataLoader(_QueryDataset(real, 0, "real"), batch_size=2)
+        threshold = 0.35
+
+        decision_scores, rows, metrics = _score_original_real_query_loader(
+            self.model,
+            loader,
+            self.pool.deep_features[:2],
+            self.pool.raw_features[:2],
+            "SyntheticReal",
+            "/tmp/checkpoint.pth",
+            "abc123",
+            scoring_mode="krq_only",
+            scoring_threshold=threshold,
+        )
+
+        torch.testing.assert_close(
+            decision_scores,
+            torch.tensor([row["decision_score"] for row in rows]),
+        )
+        self.assertAlmostEqual(
+            metrics["mean_mmd_score"],
+            sum(row["mmd_score"] for row in rows) / len(rows),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["mean_decision_score"],
+            sum(row["decision_score"] for row in rows) / len(rows),
+            places=6,
+        )
+        for row in rows:
+            self.assertAlmostEqual(row["decision_score"], 1.0 - row["mean_krq"])
+            self.assertEqual(row["prediction"], int(row["decision_score"] > threshold))
 
 
 if __name__ == "__main__":

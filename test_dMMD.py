@@ -36,6 +36,7 @@ import hydra
 from tabulate import tabulate
 import torch
 import copy
+import math
 import os
 import pandas as pd
 from pathlib import Path
@@ -50,6 +51,7 @@ from sklearn.metrics import (
 
 _CLIP_REFERENCE_MODES = frozenset({"clip_topn", "clip_bottomn"})
 _CLIP_FRAME_SOURCE = "existing_nsg_vd_8_frame_cache"
+_SCORING_MODES = frozenset({"mmd", "krq_only"})
 
 
 def _evaluation_mode(cfg):
@@ -65,6 +67,41 @@ def _reference_selection_mode(cfg):
     if selection_cfg is None:
         return "original"
     return validate_reference_selection_mode(selection_cfg.get("mode", "original"))
+
+
+def _scoring_options(cfg):
+    """Return a validated, legacy-compatible test-time scoring policy."""
+
+    scoring_cfg = cfg.get("scoring", None)
+    if scoring_cfg is None:
+        mode = "mmd"
+        threshold = 1.0
+    else:
+        mode = str(scoring_cfg.get("mode", "mmd"))
+        threshold = float(scoring_cfg.get("threshold", 1.0))
+
+    if mode not in _SCORING_MODES:
+        raise ValueError(
+            f"scoring.mode must be one of: {', '.join(sorted(_SCORING_MODES))}"
+        )
+    if not math.isfinite(threshold):
+        raise ValueError("scoring.threshold must be finite")
+    return mode, threshold
+
+
+def _build_decision_scores(mmd_scores, mean_krq, mode):
+    """Map auditable kernel components to a high-means-fake decision score."""
+
+    if mode not in _SCORING_MODES:
+        raise ValueError(
+            f"Unsupported scoring mode: {mode}. "
+            f"Expected one of {sorted(_SCORING_MODES)}"
+        )
+    if mode == "mmd":
+        return mmd_scores
+    if mean_krq is None:
+        raise ValueError("krq_only scoring requires mean_krq")
+    return 1.0 - mean_krq
 
 
 def _original_reference_options(cfg):
@@ -431,10 +468,14 @@ def _build_adaptive_reference_pool(
     )
 
 
-def _classification_metrics(real_scores, fake_scores, regression_model=None):
+def _classification_metrics(
+        real_scores,
+        fake_scores,
+        regression_model=None,
+        threshold=1.0):
     raw_predict = torch.cat([real_scores, fake_scores], dim=0).cpu()
     if regression_model is None:
-        predict = (raw_predict > 1).int()
+        predict = (raw_predict > threshold).int()
     else:
         predict = torch.as_tensor(
             regression_model.predict(raw_predict.reshape(-1, 1).numpy())
@@ -451,14 +492,14 @@ def _classification_metrics(real_scores, fake_scores, regression_model=None):
     }
 
 
-def _real_only_metrics(real_scores, regression_model=None):
+def _real_only_metrics(real_scores, regression_model=None, threshold=1.0):
     """Summarize false positives for an all-real query set."""
 
     real_scores = torch.as_tensor(real_scores).reshape(-1).cpu()
     if real_scores.numel() == 0:
         raise ValueError("real_scores must not be empty")
     if regression_model is None:
-        predictions = (real_scores > 1).int()
+        predictions = (real_scores > threshold).int()
     else:
         predictions = torch.as_tensor(
             regression_model.predict(real_scores.reshape(-1, 1).numpy())
@@ -478,6 +519,9 @@ def _real_only_metrics(real_scores, regression_model=None):
         "real_accuracy": tnr,
         "tnr": tnr,
         "fpr": fpr,
+        "mean_decision_score": float(real_scores.mean().item()),
+        # Legacy alias retained for direct callers. Higher-level evaluation
+        # replaces this with the actual MMD mean when using krq_only.
         "mean_mmd_score": float(real_scores.mean().item()),
         "predictions": predictions,
     }
@@ -494,7 +538,9 @@ def _score_adaptive_query_loader(
         generator_name,
         checkpoint_path,
         checkpoint_hash,
-        clip_cache=None):
+        clip_cache=None,
+        scoring_mode="mmd",
+        scoring_threshold=1.0):
     device = next(model.parameters()).device
     scores = []
     query_rows = []
@@ -537,37 +583,44 @@ def _score_adaptive_query_loader(
             model.is_smooth,
             query_clip_embeddings=query_clip_embeddings,
         )
-        batch_scores = batch_result.scores.detach().cpu()
+        batch_mmd_scores = batch_result.scores.detach().cpu()
         batch_mean_krr = batch_result.mean_krr.detach().cpu()
         batch_mean_krq = batch_result.mean_krq.detach().cpu()
         batch_kqq = batch_result.kqq.detach().cpu()
         reconstructed_scores = batch_mean_krr - 2 * batch_mean_krq + batch_kqq
         if not torch.allclose(
-                batch_scores,
+                batch_mmd_scores,
                 reconstructed_scores,
                 rtol=1e-5,
                 atol=1e-6):
             max_error = torch.max(
-                torch.abs(batch_scores - reconstructed_scores)
+                torch.abs(batch_mmd_scores - reconstructed_scores)
             ).item()
             raise RuntimeError(
                 "Adaptive MMD component reconstruction failed: "
                 f"maximum absolute error={max_error:.3e}"
             )
-        batch_predictions = (batch_scores > 1).int()
-        scores.append(batch_scores)
+        batch_decision_scores = _build_decision_scores(
+            batch_mmd_scores,
+            batch_mean_krq,
+            scoring_mode,
+        )
+        batch_predictions = (batch_decision_scores > scoring_threshold).int()
+        scores.append(batch_decision_scores)
 
         for index, query_id in enumerate(query_ids):
             query_rows.append({
                 "generator": generator_name,
                 "query_id": query_id,
                 "query_label": query_label,
-                "mmd_score": float(batch_scores[index]),
+                "mmd_score": float(batch_mmd_scores[index]),
+                "decision_score": float(batch_decision_scores[index]),
+                "score_mode": scoring_mode,
                 "mean_krr": float(batch_mean_krr[index]),
                 "mean_krq": float(batch_mean_krq[index]),
                 "kqq": float(batch_kqq[index]),
                 "prediction": int(batch_predictions[index]),
-                "threshold": 1.0,
+                "threshold": float(scoring_threshold),
                 "reference_mode": selection_mode,
                 "top_n": int(selection_cfg.top_n),
                 "random_seed": int(selection_cfg.random_seed),
@@ -603,7 +656,9 @@ def _score_original_real_query_loader(
         dataset_name,
         checkpoint_path,
         checkpoint_hash,
-        regression_model=None):
+        regression_model=None,
+        scoring_mode="mmd",
+        scoring_threshold=1.0):
     """Score one ordered all-real loader with the legacy fixed reference set."""
 
     model.eval()
@@ -656,11 +711,23 @@ def _score_original_real_query_loader(
     kqq_values = torch.cat(kqq_values)
     if len(query_ids) != len(scores):
         raise RuntimeError("real-only video IDs and original MMD scores are misaligned")
-    metrics = _real_only_metrics(scores, regression_model)
+    decision_scores = _build_decision_scores(
+        scores,
+        mean_krq_values,
+        scoring_mode,
+    )
+    metrics = _real_only_metrics(
+        decision_scores,
+        regression_model,
+        threshold=scoring_threshold,
+    )
+    metrics["mean_mmd_score"] = float(scores.mean().item())
+    metrics["mean_krq"] = float(mean_krq_values.mean().item())
     rows = []
-    for query_id, score, mean_krr, mean_krq, kqq, prediction in zip(
+    for query_id, score, decision_score, mean_krr, mean_krq, kqq, prediction in zip(
             query_ids,
             scores,
+            decision_scores,
             mean_krr_values,
             mean_krq_values,
             kqq_values,
@@ -670,11 +737,13 @@ def _score_original_real_query_loader(
             "query_id": query_id,
             "query_label": 0,
             "mmd_score": float(score),
+            "decision_score": float(decision_score),
+            "score_mode": scoring_mode,
             "mean_krr": float(mean_krr),
             "mean_krq": float(mean_krq),
             "kqq": float(kqq),
             "prediction": int(prediction),
-            "threshold": 1.0,
+            "threshold": float(scoring_threshold),
             "reference_mode": "original",
             "top_n": int(feature_ref.shape[0]),
             "random_seed": None,
@@ -682,7 +751,7 @@ def _score_original_real_query_loader(
             "checkpoint_path": checkpoint_path,
             "checkpoint_hash": checkpoint_hash,
         })
-    return scores, rows, metrics
+    return decision_scores, rows, metrics
 
 @hydra.main(
     config_path="configs/nsg-vd-224x224",
@@ -696,13 +765,24 @@ def main(cfg: DictConfig):
     set_seed(cfg.seed)
     evaluation_mode = _evaluation_mode(cfg)
     reference_mode = _reference_selection_mode(cfg)
+    scoring_mode, scoring_threshold = _scoring_options(cfg)
+    if scoring_mode == "krq_only" and bool(cfg.regression):
+        raise ValueError(
+            "regression calibration is not supported with krq_only scoring"
+        )
     is_adaptive = reference_mode != "original"
     record_original_scores = (
         reference_mode == "original"
-        and bool(cfg.reference_selection.get("save_original_query_scores", False))
+        and (
+            bool(cfg.reference_selection.get("save_original_query_scores", False))
+            or scoring_mode == "krq_only"
+        )
     )
     logger.info(f"Evaluation mode: {evaluation_mode}")
     logger.info(f"Reference-selection mode: {reference_mode}")
+    logger.info(
+        f"Scoring mode: {scoring_mode} | decision threshold: {scoring_threshold}"
+    )
     if record_original_scores:
         logger.info("Original per-query score logging is enabled")
 
@@ -841,7 +921,7 @@ def main(cfg: DictConfig):
     logger.info(
         f"Kernel parameters: epsilon={model.ep.item():.10g}, "
         f"sigma={model.sigma.item():.10g}, sigma0={model.sigma0_u.item():.10g}, "
-        f"is_smooth={model.is_smooth}, threshold=1"
+        f"is_smooth={model.is_smooth}"
     )
 
     if is_adaptive:
@@ -910,8 +990,20 @@ def main(cfg: DictConfig):
                 checkpoint_path=checkpoint_path,
                 checkpoint_hash=checkpoint_hash,
                 clip_cache=query_clip_cache,
+                scoring_mode=scoring_mode,
+                scoring_threshold=scoring_threshold,
             )
-            real_metrics = _real_only_metrics(real_scores, regression_model)
+            real_metrics = _real_only_metrics(
+                real_scores,
+                regression_model,
+                threshold=scoring_threshold,
+            )
+            real_metrics["mean_mmd_score"] = float(
+                sum(row["mmd_score"] for row in query_rows) / len(query_rows)
+            )
+            real_metrics["mean_krq"] = float(
+                sum(row["mean_krq"] for row in query_rows) / len(query_rows)
+            )
         else:
             real_scores, query_rows, real_metrics = _score_original_real_query_loader(
                 model,
@@ -922,6 +1014,8 @@ def main(cfg: DictConfig):
                 checkpoint_path,
                 checkpoint_hash,
                 regression_model,
+                scoring_mode,
+                scoring_threshold,
             )
 
         os.makedirs(cfg.log_path, exist_ok=True)
@@ -941,7 +1035,10 @@ def main(cfg: DictConfig):
             "tnr_percent": 100 * real_metrics["tnr"],
             "fpr_percent": 100 * real_metrics["fpr"],
             "mean_mmd_score": real_metrics["mean_mmd_score"],
-            "threshold": 1.0,
+            "mean_krq": real_metrics["mean_krq"],
+            "mean_decision_score": real_metrics["mean_decision_score"],
+            "score_mode": scoring_mode,
+            "threshold": scoring_threshold,
             "reference_mode": reference_mode,
             "reference_size": (
                 int(cfg.reference_selection.top_n)
@@ -970,7 +1067,8 @@ def main(cfg: DictConfig):
             f"N={real_metrics['num_real']} | TN={real_metrics['true_negatives']} | "
             f"FP={real_metrics['false_positives']} | "
             f"TNR={real_metrics['tnr']:.4f} | FPR={real_metrics['fpr']:.4f} | "
-            f"Mean MMD={real_metrics['mean_mmd_score']:.6f}"
+            f"Mean MMD={real_metrics['mean_mmd_score']:.6f} | "
+            f"Mean decision score={real_metrics['mean_decision_score']:.6f}"
         )
         logger.success(f"Real-only summary saved to {summary_path}")
         logger.success(f"Query scores saved to {query_score_path}")
@@ -1011,6 +1109,8 @@ def main(cfg: DictConfig):
                     real_clip_cache=real_clip_cache,
                     fake_clip_cache=fake_clip_cache,
                     regression_model=regression_model,
+                    scoring_mode=scoring_mode,
+                    scoring_threshold=scoring_threshold,
                 )
                 all_query_rows.extend(query_rows)
                 all_selection_rows.extend(selection_rows)
@@ -1030,6 +1130,8 @@ def main(cfg: DictConfig):
                     generator_name=name,
                     checkpoint_path=checkpoint_path,
                     checkpoint_hash=checkpoint_hash,
+                    scoring_mode=scoring_mode,
+                    scoring_threshold=scoring_threshold,
                 )
                 if record_original_scores:
                     test_results, query_rows = legacy_result
@@ -1100,7 +1202,9 @@ def test_dMMD(
         return_query_rows=False,
         generator_name=None,
         checkpoint_path=None,
-        checkpoint_hash=None):
+        checkpoint_hash=None,
+        scoring_mode="mmd",
+        scoring_threshold=1.0):
     model.eval()
     is_smooth = model.is_smooth
     sigma = model.sigma
@@ -1120,6 +1224,7 @@ def test_dMMD(
     fake_kqq = []
     real_ids = []
     fake_ids = []
+    need_components = return_query_rows or scoring_mode == "krq_only"
     device = next(model.parameters()).device
     with torch.no_grad():
         for idx, (real_data, fake_data) in tqdm(enumerate(zip(real_dataloader, fake_dataloader)), total=len(real_dataloader), desc="Evaluating", leave=False):
@@ -1150,7 +1255,7 @@ def test_dMMD(
                 sigma0_u,
                 ep,
                 is_smooth=is_smooth,
-                return_components=return_query_rows,
+                return_components=need_components,
             )
             fake_result = MMD_batch2(
                 torch.cat([feature_ref,feature_adv],dim=0),
@@ -1161,9 +1266,9 @@ def test_dMMD(
                 sigma0_u,
                 ep,
                 is_smooth=is_smooth,
-                return_components=return_query_rows,
+                return_components=need_components,
             )
-            if return_query_rows:
+            if need_components:
                 clean_scores, clean_krr, clean_krq, clean_kqq = real_result
                 adv_scores, adv_krr, adv_krq, adv_kqq = fake_result
                 real_mean_krr.append(clean_krr.cpu())
@@ -1180,9 +1285,29 @@ def test_dMMD(
 
         dt_clean = torch.cat(dt_clean)
         dt_adv = torch.cat(dt_adv)
-        raw_predict = torch.cat([dt_clean, dt_adv], dim=0)
+        if need_components:
+            real_mean_krr = torch.cat(real_mean_krr)
+            real_mean_krq = torch.cat(real_mean_krq)
+            real_kqq = torch.cat(real_kqq)
+            fake_mean_krr = torch.cat(fake_mean_krr)
+            fake_mean_krq = torch.cat(fake_mean_krq)
+            fake_kqq = torch.cat(fake_kqq)
+        clean_decision_scores = _build_decision_scores(
+            dt_clean,
+            real_mean_krq if need_components else None,
+            scoring_mode,
+        )
+        fake_decision_scores = _build_decision_scores(
+            dt_adv,
+            fake_mean_krq if need_components else None,
+            scoring_mode,
+        )
+        raw_predict = torch.cat(
+            [clean_decision_scores, fake_decision_scores],
+            dim=0,
+        )
         if regression_model is None:
-            predict = (raw_predict > 1).int()
+            predict = (raw_predict > scoring_threshold).int()
         else:
             predict = regression_model.predict(raw_predict.reshape(-1,1).cpu())
         labels = torch.cat([torch.zeros(len(dt_clean)), torch.ones(len(dt_adv))], dim=0)
@@ -1211,19 +1336,13 @@ def test_dMMD(
     if len(real_ids) != len(dt_clean) or len(fake_ids) != len(dt_adv):
         raise RuntimeError("recorded video IDs and original MMD scores are misaligned")
 
-    real_mean_krr = torch.cat(real_mean_krr)
-    real_mean_krq = torch.cat(real_mean_krq)
-    real_kqq = torch.cat(real_kqq)
-    fake_mean_krr = torch.cat(fake_mean_krr)
-    fake_mean_krq = torch.cat(fake_mean_krq)
-    fake_kqq = torch.cat(fake_kqq)
-
     predictions = torch.as_tensor(predict).reshape(-1).cpu()
     query_rows = []
     for (
             query_label,
             query_ids,
-            query_scores,
+            query_mmd_scores,
+            query_decision_scores,
             query_mean_krr,
             query_mean_krq,
             query_kqq,
@@ -1233,6 +1352,7 @@ def test_dMMD(
                 0,
                 real_ids,
                 dt_clean,
+                clean_decision_scores,
                 real_mean_krr,
                 real_mean_krq,
                 real_kqq,
@@ -1242,14 +1362,16 @@ def test_dMMD(
                 1,
                 fake_ids,
                 dt_adv,
+                fake_decision_scores,
                 fake_mean_krr,
                 fake_mean_krq,
                 fake_kqq,
                 predictions[len(dt_clean):],
             )):
-        for query_id, score, mean_krr, mean_krq, kqq, prediction in zip(
+        for query_id, mmd_score, decision_score, mean_krr, mean_krq, kqq, prediction in zip(
                 query_ids,
-                query_scores,
+                query_mmd_scores,
+                query_decision_scores,
                 query_mean_krr,
                 query_mean_krq,
                 query_kqq,
@@ -1258,12 +1380,14 @@ def test_dMMD(
                 "generator": generator_name,
                 "query_id": query_id,
                 "query_label": query_label,
-                "mmd_score": float(score),
+                "mmd_score": float(mmd_score),
+                "decision_score": float(decision_score),
+                "score_mode": scoring_mode,
                 "mean_krr": float(mean_krr),
                 "mean_krq": float(mean_krq),
                 "kqq": float(kqq),
                 "prediction": int(prediction),
-                "threshold": 1.0,
+                "threshold": float(scoring_threshold),
                 "reference_mode": "original",
                 "top_n": int(feature_ref.shape[0]),
                 "random_seed": None,
@@ -1286,7 +1410,9 @@ def test_adaptive_dMMD(
         checkpoint_hash,
         real_clip_cache=None,
         fake_clip_cache=None,
-        regression_model=None):
+        regression_model=None,
+        scoring_mode="mmd",
+        scoring_threshold=1.0):
     """Evaluate real and fake queries with one selected reference set per query."""
 
     model.eval()
@@ -1301,6 +1427,8 @@ def test_adaptive_dMMD(
         checkpoint_path=checkpoint_path,
         checkpoint_hash=checkpoint_hash,
         clip_cache=real_clip_cache,
+        scoring_mode=scoring_mode,
+        scoring_threshold=scoring_threshold,
     )
     fake_scores, fake_query_rows, fake_selection_rows = _score_adaptive_query_loader(
         model,
@@ -1313,8 +1441,15 @@ def test_adaptive_dMMD(
         checkpoint_path=checkpoint_path,
         checkpoint_hash=checkpoint_hash,
         clip_cache=fake_clip_cache,
+        scoring_mode=scoring_mode,
+        scoring_threshold=scoring_threshold,
     )
-    metrics = _classification_metrics(real_scores, fake_scores, regression_model)
+    metrics = _classification_metrics(
+        real_scores,
+        fake_scores,
+        regression_model,
+        threshold=scoring_threshold,
+    )
     return (
         metrics,
         real_query_rows + fake_query_rows,

@@ -18,6 +18,7 @@ class ThresholdScanTest(unittest.TestCase):
             "generator": ["A"] * 4 + ["B"] * 4,
             "query_label": [0, 0, 1, 1] * 2,
             "mmd_score": [0.2, 0.8, 1.2, 1.4, 0.6, 1.1, 0.9, 1.3],
+            "decision_score": [0.2, 0.8, 1.2, 1.4, 0.6, 1.1, 0.9, 1.3],
         })
 
     def test_threshold_grid_is_inclusive_and_decimal_stable(self):
@@ -37,6 +38,28 @@ class ThresholdScanTest(unittest.TestCase):
         self.assertAlmostEqual(macro["tnr"], 0.75)
         self.assertAlmostEqual(macro["fpr"], 0.25)
         self.assertEqual(macro["num_generators"], 2)
+
+    def test_scan_can_use_explicit_decision_score_column(self):
+        mmd_scan = scan_query_scores(self.query_scores, [1.0])
+        decision_scan = scan_query_scores(
+            self.query_scores,
+            [1.0],
+            score_column="decision_score",
+        )
+
+        self.assertEqual(set(decision_scan["score_column"]), {"decision_score"})
+        pd.testing.assert_frame_equal(
+            mmd_scan.drop(columns="score_column"),
+            decision_scan.drop(columns="score_column"),
+        )
+
+    def test_scan_requires_the_selected_score_column(self):
+        with self.assertRaisesRegex(ValueError, "decision_score"):
+            scan_query_scores(
+                self.query_scores.drop(columns="decision_score"),
+                [1.0],
+                score_column="decision_score",
+            )
 
     def test_repeated_run_summary_uses_sample_standard_deviation(self):
         first = macro_average_scan(scan_query_scores(self.query_scores, [1.0]))
@@ -70,6 +93,25 @@ class ThresholdScanTest(unittest.TestCase):
         duplicated = pd.concat([real_only, real_only.iloc[[0]]], ignore_index=True)
         with self.assertRaisesRegex(ValueError, "unique query_id"):
             scan_real_only_query_scores(duplicated, [1.0])
+
+    def test_real_only_scan_can_use_decision_score(self):
+        real_only = pd.DataFrame({
+            "query_id": ["r0", "r1", "r2"],
+            "query_label": [0, 0, 0],
+            "mmd_score": [0.1, 0.2, 0.3],
+            "decision_score": [0.4, 0.5, 0.8],
+        })
+
+        scan = scan_real_only_query_scores(
+            real_only,
+            [0.5],
+            score_column="decision_score",
+        ).iloc[0]
+
+        self.assertEqual(scan["score_column"], "decision_score")
+        self.assertAlmostEqual(scan["real_accuracy"], 2 / 3)
+        self.assertAlmostEqual(scan["mean_decision_score"], (0.4 + 0.5 + 0.8) / 3)
+        self.assertTrue(pd.isna(scan["mean_mmd_score"]))
 
     def test_real_only_run_summary_uses_sample_standard_deviation(self):
         first = pd.DataFrame({

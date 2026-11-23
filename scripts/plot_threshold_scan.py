@@ -100,6 +100,14 @@ def _parse_args():
     parser.add_argument("--threshold-stop", type=float, default=1.3)
     parser.add_argument("--threshold-step", type=float, default=0.1)
     parser.add_argument(
+        "--score-column",
+        default="mmd_score",
+        help=(
+            "query_scores.csv column to scan; use decision_score for "
+            "configured krq_only evaluations"
+        ),
+    )
+    parser.add_argument(
         "--title",
         default="Impact of decision threshold",
     )
@@ -132,7 +140,7 @@ def _load_experiments(run_specs, group_specs):
     return experiments
 
 
-def _scan_experiments(experiments, thresholds):
+def _scan_experiments(experiments, thresholds, score_column="mmd_score"):
     per_generator_outputs = []
     per_run_outputs = []
     strategy_outputs = []
@@ -141,7 +149,11 @@ def _scan_experiments(experiments, thresholds):
         run_macros = []
         for run_index, path in enumerate(paths):
             query_scores = pd.read_csv(path)
-            per_generator = scan_query_scores(query_scores, thresholds)
+            per_generator = scan_query_scores(
+                query_scores,
+                thresholds,
+                score_column=score_column,
+            )
             per_generator.insert(0, "source_csv", str(path))
             per_generator.insert(0, "run_index", run_index)
             per_generator.insert(0, "strategy", strategy)
@@ -165,7 +177,10 @@ def _scan_experiments(experiments, thresholds):
     )
 
 
-def _scan_real_only_experiments(experiments, thresholds):
+def _scan_real_only_experiments(
+        experiments,
+        thresholds,
+        score_column="mmd_score"):
     per_run_outputs = []
     strategy_outputs = []
 
@@ -173,7 +188,11 @@ def _scan_real_only_experiments(experiments, thresholds):
         run_scans = []
         for run_index, path in enumerate(paths):
             query_scores = pd.read_csv(path)
-            run_scan = scan_real_only_query_scores(query_scores, thresholds)
+            run_scan = scan_real_only_query_scores(
+                query_scores,
+                thresholds,
+                score_column=score_column,
+            )
             run_scan.insert(0, "source_csv", str(path))
             run_scan.insert(0, "run_index", run_index)
             run_scan.insert(0, "strategy", strategy)
@@ -190,7 +209,11 @@ def _scan_real_only_experiments(experiments, thresholds):
     )
 
 
-def _attach_real_accuracy(summary, standard_experiments, real_only_experiments):
+def _attach_real_accuracy(
+        summary,
+        standard_experiments,
+        real_only_experiments,
+        score_column="mmd_score"):
     result = summary.copy()
     if not real_only_experiments:
         result["real_accuracy_mean"] = result["tnr_mean"]
@@ -210,6 +233,7 @@ def _attach_real_accuracy(summary, standard_experiments, real_only_experiments):
     real_only_runs, real_only_summary = _scan_real_only_experiments(
         real_only_experiments,
         sorted(result["threshold"].unique()),
+        score_column=score_column,
     )
     real_only_for_merge = real_only_summary.rename(columns={
         "num_runs": "real_only_num_runs",
@@ -322,11 +346,16 @@ def main():
         args.threshold_stop,
         args.threshold_step,
     )
-    per_generator, per_run, summary = _scan_experiments(experiments, thresholds)
+    per_generator, per_run, summary = _scan_experiments(
+        experiments,
+        thresholds,
+        score_column=args.score_column,
+    )
     summary, real_only_runs, real_only_summary = _attach_real_accuracy(
         summary,
         experiments,
         real_only_experiments,
+        score_column=args.score_column,
     )
 
     output_dir = args.output_dir.expanduser().resolve()
@@ -354,6 +383,7 @@ def main():
     )
 
     print(f"Thresholds: {thresholds}")
+    print(f"Score column: {args.score_column}")
     print(f"Saved: {output_dir / 'threshold_scan_by_generator.csv'}")
     print(f"Saved: {output_dir / 'threshold_scan_by_run_macro.csv'}")
     print(f"Saved: {output_dir / 'threshold_scan_macro.csv'}")
